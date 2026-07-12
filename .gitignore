@@ -1,0 +1,8 @@
+token.txt
+.env
+*.db
+.venv/
+__pycache__/
+*.pyc
+vacancies_*.json
+vacancies_*.csv

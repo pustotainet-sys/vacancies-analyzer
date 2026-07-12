@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Сбор вакансий с hh.ru через API поиска.
+
+С хостинговых/облачных IP анти-бот hh отдаёт 403 на /vacancies без авторизации.
+Решается токеном приложения: скрипт сам получает его через grant_type=client_credentials
+из HH_CLIENT_ID / HH_CLIENT_SECRET (данные твоего зарегистрированного приложения).
+Готовый токен можно передать напрямую через HH_ACCESS_TOKEN.
+"""
+
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+import requests
+
+API_URL = "https://api.hh.ru/vacancies"
+TOKEN_URL = "https://api.hh.ru/token"
+# hh просит указывать User-Agent, идентифицирующий приложение (см. док API).
+USER_AGENT = os.getenv("HH_USER_AGENT", "hh-vacancies-analyzer/1.0")
+MAX_PER_PAGE = 100
+# hh отдаёт максимум 2000 результатов на один поисковый запрос.
+API_RESULT_LIMIT = 2000
+
+
+def get_app_token(client_id, client_secret):
+    resp = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def build_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    token = os.getenv("HH_ACCESS_TOKEN")
+    if not token:
+        client_id = os.getenv("HH_CLIENT_ID")
+        client_secret = os.getenv("HH_CLIENT_SECRET")
+        if client_id and client_secret:
+            token = get_app_token(client_id, client_secret)
+            print("Получен токен приложения (client_credentials).", file=sys.stderr)
+
+    if token:
+        session.headers["Authorization"] = f"Bearer {token}"
+    else:
+        print(
+            "ВНИМАНИЕ: нет токена (HH_ACCESS_TOKEN или HH_CLIENT_ID/HH_CLIENT_SECRET). "
+            "С облачного IP hh вернёт 403 на поиск.",
+            file=sys.stderr,
+        )
+    return session
+
+
+def fetch_page(session, params, page):
+    resp = session.get(API_URL, params={**params, "page": page}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_vacancies(session, text, area, per_page, max_items, extra_params=None,
+                    search_field=None):
+    params = {
+        "text": text,
+        "area": area,
+        "per_page": min(per_page, MAX_PER_PAGE),
+    }
+    # по умолчанию hh ищет по всем полям (как на сайте); name/company/description —
+    # чтобы сузить. Раньше было жёстко "name" — это резко занижало число вакансий.
+    if search_field:
+        params["search_field"] = search_field
+    if extra_params:
+        params.update(extra_params)
+
+    items = []
+    first = fetch_page(session, params, 0)
+    total_found = first["found"]
+    total_pages = first["pages"]
+    items.extend(first["items"])
+    print(f"Найдено вакансий: {total_found} (страниц: {total_pages})", file=sys.stderr)
+
+    for page in range(1, total_pages):
+        if max_items and len(items) >= max_items:
+            break
+        if page * params["per_page"] >= API_RESULT_LIMIT:
+            print(f"Достигнут лимит API в {API_RESULT_LIMIT} результатов на запрос.", file=sys.stderr)
+            break
+        data = fetch_page(session, params, page)
+        items.extend(data["items"])
+        print(f"  страница {page + 1}/{total_pages}, собрано {len(items)}", file=sys.stderr)
+        time.sleep(0.3)  # мягкий троттлинг, чтобы не упереться в rate limit
+
+    if max_items:
+        items = items[:max_items]
+    return items, total_found
+
+
+def flatten(v):
+    salary = v.get("salary") or {}
+    return {
+        "id": v.get("id"),
+        "name": v.get("name"),
+        "company": (v.get("employer") or {}).get("name"),
+        "area": (v.get("area") or {}).get("name"),
+        "salary_from": salary.get("from"),
+        "salary_to": salary.get("to"),
+        "currency": salary.get("currency"),
+        "experience": (v.get("experience") or {}).get("name"),
+        "employment": (v.get("employment") or {}).get("name"),
+        "schedule": (v.get("schedule") or {}).get("name"),
+        "published_at": v.get("published_at"),
+        "url": v.get("alternate_url"),
+    }
+
+
+def save_json(items, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+
+def save_csv(rows, path):
+    if not rows:
+        return
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Сбор вакансий с hh.ru")
+    p.add_argument("--text", default="python", help="поисковый запрос (по умолчанию: python)")
+    p.add_argument("--area", default="113", help="регион: 113=Россия, 1=Москва, 2=СПб (по умолчанию: 113)")
+    p.add_argument("--per-page", type=int, default=100, help="вакансий на страницу, макс 100")
+    p.add_argument("--max-items", type=int, default=500, help="сколько всего вакансий собрать (0 = все доступные)")
+    p.add_argument("--out-dir", default=".", help="каталог для выходных файлов")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    session = build_session()
+
+    try:
+        raw, total_found = fetch_vacancies(
+            session, args.text, args.area, args.per_page, args.max_items or None
+        )
+    except requests.HTTPError as e:
+        print(f"Ошибка API: {e} — {e.response.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+
+    rows = [flatten(v) for v in raw]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    os.makedirs(args.out_dir, exist_ok=True)
+    json_path = os.path.join(args.out_dir, f"vacancies_{args.text}_{stamp}.json")
+    csv_path = os.path.join(args.out_dir, f"vacancies_{args.text}_{stamp}.csv")
+
+    save_json(raw, json_path)
+    save_csv(rows, csv_path)
+
+    print(f"\nВсего по запросу '{args.text}': {total_found}")
+    print(f"Собрано и сохранено: {len(rows)}")
+    print(f"  JSON: {json_path}")
+    print(f"  CSV:  {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

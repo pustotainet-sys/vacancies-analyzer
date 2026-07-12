@@ -16,14 +16,18 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
+import envfile
+envfile.load()  # .env -> os.environ ДО чтения параметров модулями и константами ниже
+
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
-                      Update)
+                      ReplyKeyboardRemove, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, ConversationHandler, MessageHandler,
                           filters)
 
 import analysis
 import collector
+import llm
 import storage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +43,10 @@ ONDEMAND_TOP_N = int(os.environ.get("ONDEMAND_TOP_N", "100"))
 VACS_LIST_N = int(os.environ.get("VACS_LIST_N", "12"))
 DETAIL_THROTTLE = float(os.environ.get("DETAIL_THROTTLE", "0.2"))
 COLLECT_INTERVAL = int(float(os.environ.get("COLLECT_HOURS", "6")) * 3600)
+# сколько секунд снимок кастомного запроса считается свежим: пока свеж — /top читает
+# его из базы без пересбора и обращений к LLM. Принудительный сбор (⟳/refresh) — всегда.
+CUSTOM_FRESH_SECONDS = int(float(os.environ.get("CUSTOM_FRESH_HOURS",
+                                               os.environ.get("COLLECT_HOURS", "6"))) * 3600)
 DB_PATH = os.environ.get("DB_PATH", os.path.join(HERE, "hh_stats.db"))
 
 AREA_NAMES = {"113": "Россия", "1": "Москва", "2": "СПб"}
@@ -156,11 +164,15 @@ def _vac_url(row):
 
 
 def _btn_label(i, row):
-    """Подпись кнопки-вакансии: номер, название (обрезанное), дата."""
+    """Подпись кнопки-вакансии: номер, название, компания, дата (обрезано под кнопку)."""
     title = row.get("name") or "—"
-    if len(title) > 44:
-        title = title[:43] + "…"
-    return f"{i}. {title} · {_fmt_date(row['published_at'])}"
+    company = row.get("company") or "—"
+    if len(title) > 30:
+        title = title[:29] + "…"
+    if len(company) > 20:
+        company = company[:19] + "…"
+    date = (row.get("published_at") or "")[5:10]  # MM-DD
+    return f"{i}. {title} · {company} · {date}"
 
 
 def render_vacancies(rows, snap, state):
@@ -264,10 +276,17 @@ HELP = (
     "📈 Тренд за месяц — что выросло/упало/появилось/исчезло\n"
     "🔁 Что изменилось — дифф с прошлого сбора\n"
     "⚙️ Фильтры — регион, период, размер топа, свой запрос\n"
-    "⟳ Собрать сейчас (кнопка) или /refresh — принудительный сбор\n\n"
+    "⟳ Собрать сейчас (кнопка) или /refresh — принудительный сбор\n"
+    "/collect_llm — сбор с анализом через LLM; /collect_basic — без LLM\n\n"
     "По расписанию собирается python/Россия; свой запрос считается «здесь и сейчас», "
     "без истории трендов."
 )
+
+
+async def _reset_and_menu(context, chat_id, text):
+    """Убрать «призрачную» reply-клавиатуру (от прежнего бота на этом токене) и дать меню."""
+    await context.bot.send_message(chat_id, text, reply_markup=ReplyKeyboardRemove())
+    await context.bot.send_message(chat_id, MENU_TEXT, reply_markup=main_kb())
 
 
 async def cmd_start(update, context):
@@ -276,7 +295,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Доступ ограничен.")
         return
     _state(context, cid)
-    await update.message.reply_text(HELP, reply_markup=main_kb())
+    await _reset_and_menu(context, cid, HELP)
 
 
 async def cmd_top(update, context):
@@ -315,15 +334,21 @@ async def cmd_status(update, context):
     if not _allowed(cid):
         return
     conn = _conn(context)
+    st = _state(context, cid)
     L = storage.latest_ok_snapshot(conn, DEFAULT_QUERY, DEFAULT_AREA)
     last = storage.last_snapshot(conn, DEFAULT_QUERY, DEFAULT_AREA)
-    lines = [f"Отслеживается: {DEFAULT_QUERY} / {_area_label(DEFAULT_AREA)}",
+    lines = [f"Ваш активный запрос: {st['query_text']} / {_area_label(st['area'])}",
+             f"Отслеживается (тренды): {DEFAULT_QUERY} / {_area_label(DEFAULT_AREA)}",
              f"Автосбор каждые {COLLECT_INTERVAL/3600:g} ч."]
     if L:
+        method = L["method"] if "method" in L.keys() and L["method"] else "?"
         lines.append(f"Последний сбор: {L['ts_msk']}; вакансий {L['vacancy_count']} "
-                     f"(деталей {L['enriched_count']})")
+                     f"(деталей {L['enriched_count']}); метод: {method}")
     else:
         lines.append("Успешных сборов ещё нет.")
+    llm_state = "включён" if llm.available() else "нет ключа (OPENROUTER_API_KEY)"
+    lines.append(f"LLM: {llm_state}; режим: {os.environ.get('LLM_MODE', 'auto')}")
+    lines.append("Модели (приоритет): " + ", ".join(llm.models()))
     if last and last["status"] == "error":
         lines.append(f"⚠️ Последний сбор с ошибкой: {last['error']}")
     if collector.is_busy():
@@ -331,17 +356,43 @@ async def cmd_status(update, context):
     await context.bot.send_message(cid, "\n".join(lines), reply_markup=main_kb())
 
 
+async def _collect_active(context, chat_id, mode=None):
+    """Принудительный сбор активного запроса чата (то, что показывают /top и /vacancies)."""
+    if collector.is_busy():
+        await context.bot.send_message(chat_id, "Сбор уже идёт — дождитесь окончания.")
+        return
+    st = _state(context, chat_id)
+    is_default = st["query_text"] == DEFAULT_QUERY and str(st["area"]) == str(DEFAULT_AREA)
+    top_n = ANALYZE_TOP_N if is_default else ONDEMAND_TOP_N
+    label = {"llm": " (LLM)", "basic": " (базовый)"}.get(mode, "")
+    await context.bot.send_message(
+        chat_id, f"Запускаю сбор{label}: {st['query_text']} / {_area_label(st['area'])}…")
+    await _run_collect(context, st["query_text"], st["area"], top_n,
+                       notify_chat=chat_id, mode=mode)
+
+
 async def cmd_refresh(update, context):
-    """Принудительный сбор отслеживаемого запроса (доступно всем разрешённым)."""
+    """Принудительный сбор активного запроса (режим по умолчанию, LLM_MODE)."""
     cid = update.effective_chat.id
     if not _allowed(cid):
         return
-    if collector.is_busy():
-        await context.bot.send_message(cid, "Сбор уже идёт — дождитесь окончания.")
+    await _collect_active(context, cid)
+
+
+async def cmd_collect_llm(update, context):
+    """Сбор с обязательным анализом через LLM."""
+    cid = update.effective_chat.id
+    if not _allowed(cid):
         return
-    await context.bot.send_message(
-        cid, f"Запускаю принудительный сбор {DEFAULT_QUERY}/{_area_label(DEFAULT_AREA)}…")
-    await _run_collect(context, DEFAULT_QUERY, DEFAULT_AREA, ANALYZE_TOP_N, notify_chat=cid)
+    await _collect_active(context, cid, mode="llm")
+
+
+async def cmd_collect_basic(update, context):
+    """Сбор с базовым анализом (без LLM, по словарю)."""
+    cid = update.effective_chat.id
+    if not _allowed(cid):
+        return
+    await _collect_active(context, cid, mode="basic")
 
 
 async def cmd_collect(update, context):
@@ -378,34 +429,73 @@ async def log_update(update, context):
 
 
 async def unknown(update, context):
-    """Ответ на текст/команду, которые не распознаны (вне диалога)."""
+    """Ответ на текст/команду, которые не распознаны (вне диалога).
+
+    Заодно убирает возможную чужую reply-клавиатуру от прежнего бота на этом токене.
+    """
     cid = update.effective_chat.id
     if not _allowed(cid):
         return
-    await context.bot.send_message(
-        cid, "Не понял. Нажмите кнопку ниже или /help.", reply_markup=main_kb())
+    await _reset_and_menu(context, cid, "Не понял. Старые кнопки убраны — пользуйтесь меню ниже.")
 
 
 # --- ядро действий -----------------------------------------------------------
-async def _run_collect(context, query, area, top_n, notify_chat=None):
+async def _run_collect(context, query, area, top_n, notify_chat=None, summary=True, mode=None):
+    """Запустить сбор. progress-сообщение («Догружаю N…») шлётся только при новых
+    вакансиях; итог — по возвращённому статусу (summary=False подавляет «Готово»)."""
     conn = _conn(context)
-    msgs = []
+    loop = asyncio.get_running_loop()
+
+    def progress(msg):
+        if notify_chat is not None:
+            asyncio.run_coroutine_threadsafe(
+                context.bot.send_message(notify_chat, msg), loop)
+
     res = await asyncio.to_thread(collector.collect_once, conn, query, area,
-                                  top_n, DETAIL_THROTTLE, msgs.append)
-    if notify_chat and msgs:
-        await context.bot.send_message(notify_chat, msgs[-1])
-    if res.get("status") == "error" and ADMINS:
+                                  top_n, DETAIL_THROTTLE, progress, mode)
+    status = res.get("status")
+    if notify_chat is not None:
+        if status == "busy":
+            await context.bot.send_message(notify_chat, "Сбор уже идёт, подождите…")
+        elif status == "error":
+            await context.bot.send_message(notify_chat, f"Ошибка сбора: {res['error']}")
+        elif status == "ok" and summary:
+            await context.bot.send_message(
+                notify_chat, f"Готово [{res.get('method', '?')}]. Вакансий: {res['n']} "
+                             f"(новых: {res['new']}, из кэша: {res['reused']}). "
+                             f"Топ: {', '.join(res['top'])}")
+    if status == "error" and ADMINS:
         for a in ADMINS:
             await context.bot.send_message(int(a), f"⚠️ Сбор упал: {res['error']}")
     return res
 
 
+def _snapshot_age(row):
+    """Возраст ok-снимка в секундах (None, если снимка нет)."""
+    if not row:
+        return None
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(row["ts_utc"])).total_seconds()
+
+
 async def _ensure_custom_snapshot(context, chat_id, st):
-    """Для не-дефолтного запроса собрать по требованию (анализ «сейчас»)."""
+    """Для не-дефолтного запроса собрать по требованию — но только если базы нет/устарела.
+
+    Если снимок свежий (моложе CUSTOM_FRESH_SECONDS) — читаем его как есть, без пересбора
+    и без обращений к LLM. Итог не шлём (следом идёт таблица топа).
+    """
     if st["query_text"] == DEFAULT_QUERY and str(st["area"]) == str(DEFAULT_AREA):
+        return  # отслеживаемый запрос — используем данные планового сбора
+    conn = _conn(context)
+    age = _snapshot_age(storage.latest_ok_snapshot(conn, st["query_text"], st["area"]))
+    if age is not None and age < CUSTOM_FRESH_SECONDS:
+        return  # база свежая — без сбора и LLM
+    if collector.is_busy():
+        await context.bot.send_message(
+            chat_id, "Сейчас идёт другой сбор — показываю последние данные по запросу "
+                     "(если есть). Повторите позже для свежих.")
         return
-    await context.bot.send_message(chat_id, "Собираю свежие вакансии по запросу…")
-    await _run_collect(context, st["query_text"], st["area"], ONDEMAND_TOP_N)
+    await _run_collect(context, st["query_text"], st["area"], ONDEMAND_TOP_N,
+                       notify_chat=chat_id, summary=False)
 
 
 async def _do_top(context, chat_id):
@@ -473,10 +563,7 @@ async def on_callback(update, context):
     elif data == "diff":
         await _do_trend(context, cid, kind="diff")
     elif data == "collect":
-        await q.message.reply_text("Запускаю сбор…")
-        st = _state(context, cid)
-        top_n = ANALYZE_TOP_N if st["query_text"] == DEFAULT_QUERY else ONDEMAND_TOP_N
-        await _run_collect(context, st["query_text"], st["area"], top_n, notify_chat=cid)
+        await _collect_active(context, cid)
     elif data == "flt":
         st = _state(context, cid)
         await q.edit_message_text(FILTER_TEXT, reply_markup=filter_kb(st))
@@ -543,6 +630,8 @@ async def post_init(app):
         BotCommand("diff", "Что изменилось"),
         BotCommand("filters", "Фильтры"),
         BotCommand("refresh", "Обновить данные (сбор сейчас)"),
+        BotCommand("collect_llm", "Сбор с анализом через LLM"),
+        BotCommand("collect_basic", "Сбор без LLM (по словарю)"),
         BotCommand("status", "Статус сбора"),
         BotCommand("help", "Справка"),
     ])
@@ -552,7 +641,10 @@ def main():
     conn = storage.connect(DB_PATH)
     storage.init_schema(conn)
 
-    app = Application.builder().token(get_token()).post_init(post_init).build()
+    # concurrent_updates(True): апдейты разных пользователей обрабатываются
+    # параллельно — долгий сбор одного не блокирует остальных.
+    app = (Application.builder().token(get_token())
+           .concurrent_updates(True).post_init(post_init).build())
     app.bot_data["conn"] = conn
 
     conv = ConversationHandler(
@@ -570,6 +662,8 @@ def main():
     app.add_handler(CommandHandler("filters", cmd_filters))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
+    app.add_handler(CommandHandler("collect_llm", cmd_collect_llm))
+    app.add_handler(CommandHandler("collect_basic", cmd_collect_basic))
     app.add_handler(CommandHandler("collect", cmd_collect))
     app.add_handler(CommandHandler("dict", cmd_dict))
     app.add_handler(CallbackQueryHandler(on_callback))

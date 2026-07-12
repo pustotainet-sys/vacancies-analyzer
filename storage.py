@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     query_text TEXT NOT NULL, area TEXT NOT NULL,
     per_page INTEGER, max_items INTEGER,
     total_found INTEGER, vacancy_count INTEGER, enriched_count INTEGER DEFAULT 0,
-    status TEXT NOT NULL, error TEXT, duration_sec REAL);
+    method TEXT, status TEXT NOT NULL, error TEXT, duration_sec REAL);
 CREATE INDEX IF NOT EXISTS ix_snap_query ON snapshots(query_text, area, ts_utc);
 
 CREATE TABLE IF NOT EXISTS tech_counts (
@@ -72,6 +72,10 @@ def init_schema(conn):
                 conn.execute(f"ALTER TABLE vacancies ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError:
                 pass  # колонка уже есть
+        try:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN method TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
                      (SCHEMA_VERSION,))
         conn.commit()
@@ -94,11 +98,12 @@ def write_snapshot(conn, meta, result, raw_rows):
     with _LOCK:
         cur = conn.execute(
             """INSERT INTO snapshots(ts_utc, ts_msk, query_text, area, per_page, max_items,
-                   total_found, vacancy_count, enriched_count, status, duration_sec)
-               VALUES(?,?,?,?,?,?,?,?,?, 'ok', ?)""",
+                   total_found, vacancy_count, enriched_count, method, status, duration_sec)
+               VALUES(?,?,?,?,?,?,?,?,?,?, 'ok', ?)""",
             (ts_utc, ts_msk, meta["query_text"], str(meta["area"]),
              meta.get("per_page"), meta.get("max_items"), meta.get("total_found"),
-             n, meta.get("enriched_count", 0), meta.get("duration_sec")))
+             n, meta.get("enriched_count", 0), meta.get("method"),
+             meta.get("duration_sec")))
         run_id = cur.lastrowid
 
         conn.executemany(
@@ -247,6 +252,27 @@ def get_vacancy(conn, vac_id):
             "SELECT * FROM vacancies WHERE vac_id=? ORDER BY run_id DESC LIMIT 1",
             (str(vac_id),)).fetchone()
     return dict(row) if row else None
+
+
+def stored_details(conn, vac_ids):
+    """Уже сохранённые детали по списку vac_id: {vac_id: {key_skills_json, description}}.
+
+    Берётся самая свежая версия с непустой деталью — чтобы не качать её из hh повторно.
+    """
+    if not vac_ids:
+        return {}
+    ids = [str(v) for v in vac_ids]
+    ph = ",".join("?" * len(ids))
+    with _LOCK:
+        rows = conn.execute(
+            f"SELECT vac_id, key_skills_json, description FROM vacancies "
+            f"WHERE vac_id IN ({ph}) AND description IS NOT NULL "
+            f"ORDER BY run_id DESC", ids).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["vac_id"], {"key_skills_json": r["key_skills_json"],
+                                     "description": r["description"]})
+    return out
 
 
 def cooccurrence(conn, run_id, tech, limit=8):

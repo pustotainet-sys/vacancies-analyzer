@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import requests
 
 import extract
+import llm
 import skills_dict
 import storage
 from hh_vacancies import API_URL, build_session, fetch_vacancies
@@ -51,17 +52,49 @@ def _raw_row(v):
     }
 
 
-def collect_once(conn, query, area, analyze_top_n, throttle=0.2, notify=None):
+def _gazetteer(conn, items):
+    learned = storage.learned_map(conn)
+    skill_map = skills_dict.merged_with_learned(learned)
+    matcher = extract.build_matcher(skill_map)
+    alias_map = skills_dict.alias_to_canonical(skill_map)
+    return extract.aggregate(items, matcher, alias_map)
+
+
+def _analyze(conn, items, mode, progress):
+    """Выбор режима извлечения. Возвращает (result, method).
+
+    mode: 'llm' | 'basic' | 'auto'. LLM — основной; при сбое или отсутствии ключа —
+    откат на базовый (gazetteer).
+    """
+    mode = (mode or os.environ.get("LLM_MODE", "auto")).lower()
+    want_llm = mode == "llm" or (mode == "auto" and llm.available())
+    if want_llm:
+        if not llm.available():
+            if progress:
+                progress("OPENROUTER_API_KEY не задан — использую базовый режим…")
+            return _gazetteer(conn, items), "basic (нет ключа LLM)"
+        try:
+            return llm.aggregate_llm(items, progress=progress), "llm"
+        except Exception as e:
+            if progress:
+                progress(f"LLM недоступен ({type(e).__name__}) — базовый режим…")
+            print(f"[collect] LLM ошибка: {e}", flush=True)
+            return _gazetteer(conn, items), "basic (откат с LLM)"
+    return _gazetteer(conn, items), "basic"
+
+
+def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, mode=None):
     """Собрать и записать один снимок. Возвращает dict со статусом.
 
-    Не пересекается с другим прогоном: если занято — сразу выходит со status='busy'.
+    progress(msg) — необязательный колбэк, вызывается только когда реально начинается
+    догрузка новых вакансий (не при работе из кэша). Итог/ошибку сообщает вызывающий
+    по возвращённому dict. Не пересекается с другим прогоном (status='busy').
     """
     if not _guard.acquire(blocking=False):
-        if notify:
-            notify("Сбор уже идёт, подождите…")
         return {"status": "busy"}
     _busy.set()
     t0 = time.monotonic()
+    session = None
     try:
         session = build_session()
         # search_field пуст -> hh ищет по всем полям (как на сайте); можно сузить
@@ -72,61 +105,73 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, notify=None):
             extra_params={"order_by": "publication_time"}, search_field=search_field)
 
         total = len(items)
-        print(f"[collect] обогащение деталями: {total} вакансий "
-              f"(~{total * (throttle + 0.15):.0f}с)…", flush=True)
-        enriched = 0
-        for i, v in enumerate(items, 1):
+        # детали уже виденных вакансий берём из БД — по сети тянем только новые
+        cached = storage.stored_details(conn, [str(v["id"]) for v in items])
+        new_items = [v for v in items if str(v["id"]) not in cached]
+        print(f"[collect] вакансий: {total}; из БД: {len(cached)}; новых к загрузке: "
+              f"{len(new_items)} (~{len(new_items) * (throttle + 0.15):.0f}с)…", flush=True)
+        # сообщаем пользователю только если реально идёт догрузка новых вакансий
+        if new_items and progress:
+            progress(f"Догружаю {len(new_items)} новых вакансий…")
+
+        enriched, reused, done = 0, 0, 0
+        for v in items:
+            vid = str(v["id"])
+            if vid in cached:
+                c = cached[vid]
+                v["description"] = c["description"]
+                v["key_skills"] = json.loads(c["key_skills_json"]) if c["key_skills_json"] else None
+                reused += 1
+                enriched += 1
+                continue
             try:
-                detail = fetch_vacancy_detail(session, v["id"])
+                detail = fetch_vacancy_detail(session, vid)
                 v["description"] = detail.get("description")
                 v["key_skills"] = detail.get("key_skills")
                 enriched += 1
                 if throttle:
                     time.sleep(throttle)
             except requests.RequestException:
-                continue  # деталь не загрузилась — останется сниппет как fallback
-            if i % 25 == 0 or i == total:
-                print(f"[collect]   деталей {i}/{total}", flush=True)
+                pass  # деталь не загрузилась — останется сниппет как fallback
+            done += 1
+            if new_items and (done % 25 == 0 or done == len(new_items)):
+                print(f"[collect]   новых деталей {done}/{len(new_items)}", flush=True)
 
-        learned = storage.learned_map(conn)
-        skill_map = skills_dict.merged_with_learned(learned)
-        matcher = extract.build_matcher(skill_map)
-        alias_map = skills_dict.alias_to_canonical(skill_map)
-        result = extract.aggregate(items, matcher, alias_map)
+        result, method = _analyze(conn, items, mode, progress)
 
         meta = {
             "query_text": query, "area": area, "per_page": 100,
-            "max_items": analyze_top_n, "total_found": total_found,
+            "max_items": analyze_top_n, "total_found": total_found, "method": method,
             "enriched_count": enriched, "duration_sec": round(time.monotonic() - t0, 1),
         }
         raw_rows = [_raw_row(v) for v in items]
         run_id = storage.write_snapshot(conn, meta, result, raw_rows)
+        skill_map = skills_dict.merged_with_learned(storage.learned_map(conn))
         storage.upsert_learned(conn, result["raw_skills"], _known_aliases(skill_map))
         storage.prune_raw(conn, _retention_days())
 
         top = sorted(result["df"].items(), key=lambda kv: -kv[1])[:10]
-        if notify:
-            notify(f"Готово. Вакансий: {result['n']} (деталей: {enriched}). "
-                   f"Топ: {', '.join(t for t, _ in top[:5])}")
-        return {"status": "ok", "run_id": run_id, "n": result["n"],
-                "enriched": enriched, "top": top}
+        return {"status": "ok", "run_id": run_id, "n": result["n"], "method": method,
+                "enriched": enriched, "reused": reused, "new": len(new_items),
+                "top": [t for t, _ in top[:5]]}
 
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
-        if code == 403:
-            err = ("hh 403: нет валидного токена приложения "
-                   "(HH_CLIENT_ID/HH_CLIENT_SECRET) или запрос с облачного IP")
+        body = e.response.text[:200] if e.response is not None else ""
+        has_token = bool(session and "Authorization" in session.headers)
+        if code == 403 and not has_token:
+            err = ("hh 403: токен приложения не получен — проверьте HH_CLIENT_ID/"
+                   "HH_CLIENT_SECRET в окружении бота")
+        elif code == 403:
+            err = (f"hh 403 несмотря на токен — вероятно лимит запросов или блок IP. "
+                   f"Ответ hh: {body}")
         else:
-            err = f"hh HTTP {code}: {str(e)[:200]}"
+            err = f"hh HTTP {code}: {body or str(e)[:200]}"
         storage.write_error_snapshot(conn, query, area, err)
-        if notify:
-            notify(f"Ошибка сбора: {err}")
         return {"status": "error", "error": err}
     except Exception as e:  # сеть/парсинг — не роняем бота
         err = f"{type(e).__name__}: {str(e)[:200]}"
         storage.write_error_snapshot(conn, query, area, err)
-        if notify:
-            notify(f"Ошибка сбора: {err}")
         return {"status": "error", "error": err}
     finally:
         _busy.clear()

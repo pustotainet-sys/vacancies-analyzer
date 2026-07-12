@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 
 import requests
 
+import envfile
+envfile.load()  # .env -> os.environ до чтения констант ниже
+
 API_URL = "https://api.hh.ru/vacancies"
 TOKEN_URL = "https://api.hh.ru/token"
 # hh просит указывать User-Agent, идентифицирующий приложение (см. док API).
@@ -26,7 +29,14 @@ MAX_PER_PAGE = 100
 API_RESULT_LIMIT = 2000
 
 
+# кэш токена приложения: не запрашивать новый на каждый сбор (лишняя нагрузка на /token)
+_token_cache = {"token": None, "exp": 0.0}
+
+
 def get_app_token(client_id, client_secret):
+    now = time.monotonic()
+    if _token_cache["token"] and now < _token_cache["exp"]:
+        return _token_cache["token"]
     resp = requests.post(
         TOKEN_URL,
         data={
@@ -38,7 +48,12 @@ def get_app_token(client_id, client_secret):
         timeout=30,
     )
     resp.raise_for_status()
-    return resp.json()["access_token"]
+    data = resp.json()
+    token = data["access_token"]
+    ttl = int(data.get("expires_in", 1209600))  # hh: обычно ~2 недели
+    _token_cache["token"] = token
+    _token_cache["exp"] = now + max(60, ttl - 300)  # обновить заранее, с запасом 5 мин
+    return token
 
 
 def build_session() -> requests.Session:

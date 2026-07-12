@@ -1,5 +1,6 @@
 token.txt
 .env
+.hh_token.json
 *.db
 .venv/
 __pycache__/

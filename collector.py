@@ -160,8 +160,9 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
         body = e.response.text[:200] if e.response is not None else ""
         has_token = bool(session and "Authorization" in session.headers)
         if code == 403 and not has_token:
-            err = ("hh 403: токен приложения не получен — проверьте HH_CLIENT_ID/"
-                   "HH_CLIENT_SECRET в окружении бота")
+            err = ("hh 403 без токена: не удалось получить/обновить токен приложения "
+                   "(возможно 'refresh too early') И запрос с облачного IP. С домашнего IP "
+                   "поиск обычно работает без токена; проверьте HH_CLIENT_ID/SECRET, если нужен токен")
         elif code == 403:
             err = (f"hh 403 несмотря на токен — вероятно лимит запросов или блок IP. "
                    f"Ответ hh: {body}")

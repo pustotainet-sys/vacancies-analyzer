@@ -29,14 +29,40 @@ MAX_PER_PAGE = 100
 API_RESULT_LIMIT = 2000
 
 
-# кэш токена приложения: не запрашивать новый на каждый сбор (лишняя нагрузка на /token)
+# Кэш токена приложения. hh отдаёт долгоживущий токен (~14 дней) и запрещает
+# частые запросы нового ("app token refresh too early"). Поэтому храним токен на диске
+# и переиспользуем между перезапусками; время — wall-clock (time.time), чтобы пережить рестарт.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_TOKEN_FILE = os.path.join(_HERE, ".hh_token.json")
 _token_cache = {"token": None, "exp": 0.0}
 
 
+def _load_token_file():
+    try:
+        with open(_TOKEN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("token"), float(d.get("exp", 0))
+    except Exception:
+        return None, 0.0
+
+
+def _save_token_file(token, exp):
+    try:
+        with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"token": token, "exp": exp}, f)
+    except Exception as exc:
+        print(f"ВНИМАНИЕ: не удалось сохранить токен: {exc}", file=sys.stderr)
+
+
 def get_app_token(client_id, client_secret):
-    now = time.monotonic()
+    now = time.time()
     if _token_cache["token"] and now < _token_cache["exp"]:
         return _token_cache["token"]
+    ftoken, fexp = _load_token_file()  # переживает перезапуск -> без лишних /token
+    if ftoken and now < fexp:
+        _token_cache["token"], _token_cache["exp"] = ftoken, fexp
+        return ftoken
+
     resp = requests.post(
         TOKEN_URL,
         data={
@@ -51,8 +77,10 @@ def get_app_token(client_id, client_secret):
     data = resp.json()
     token = data["access_token"]
     ttl = int(data.get("expires_in", 1209600))  # hh: обычно ~2 недели
-    _token_cache["token"] = token
-    _token_cache["exp"] = now + max(60, ttl - 300)  # обновить заранее, с запасом 5 мин
+    exp = now + max(60, ttl - 300)  # обновить заранее, с запасом 5 мин
+    _token_cache["token"], _token_cache["exp"] = token, exp
+    _save_token_file(token, exp)
+    print("Получен токен приложения (client_credentials).", file=sys.stderr)
     return token
 
 
@@ -65,15 +93,18 @@ def build_session() -> requests.Session:
         client_id = os.getenv("HH_CLIENT_ID")
         client_secret = os.getenv("HH_CLIENT_SECRET")
         if client_id and client_secret:
-            token = get_app_token(client_id, client_secret)
-            print("Получен токен приложения (client_credentials).", file=sys.stderr)
+            # неудача получения токена НЕ фатальна: с домашнего IP поиск работает и без него
+            try:
+                token = get_app_token(client_id, client_secret)
+            except Exception as exc:
+                print(f"ВНИМАНИЕ: не удалось получить токен приложения: {exc}. "
+                      "Продолжаю без токена (ок для домашнего IP).", file=sys.stderr)
 
     if token:
         session.headers["Authorization"] = f"Bearer {token}"
     else:
         print(
-            "ВНИМАНИЕ: нет токена (HH_ACCESS_TOKEN или HH_CLIENT_ID/HH_CLIENT_SECRET). "
-            "С облачного IP hh вернёт 403 на поиск.",
+            "ВНИМАНИЕ: работаю без токена. С облачного/хостингового IP hh вернёт 403 на поиск.",
             file=sys.stderr,
         )
     return session

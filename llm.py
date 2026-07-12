@@ -13,7 +13,6 @@ import math
 import os
 import re
 from collections import Counter
-from itertools import combinations
 
 import requests
 
@@ -65,10 +64,6 @@ def _max_tokens():
     # лимит вывода. Для 50 вакансий JSON-ответ крупнее — берём с запасом.
     # (у платных моделей слишком большой max_tokens может дать 402 по кредитам.)
     return int(os.environ.get("LLM_MAX_TOKENS", "8000"))
-
-
-def _cooccur_top_k():
-    return int(os.environ.get("COOCCUR_TOP_K", "40"))
 
 
 def _chat(messages, temperature=0.0, timeout=180):
@@ -147,13 +142,18 @@ def _vacancy_block(i, v, max_desc):
 
 
 _BATCH_SYS = (
-    "Ты эксперт по технологиям и языкам программирования. "
-    "Ты извлекаешь требуемые навыки, технологии, технический стек из вакансий. Для каждой вакансии верни список "
-    "технологий, языков, фреймворков, библиотек, БД, инструментов и платформ, которые "
-    "реально требуются. НЕ включай soft skills, общие слова, названия компаний, "
-    "должности. Используй канонические англоязычные названия там, где это принято "
-    "(Python, PostgreSQL, Docker, FastAPI, Kubernetes). Ответь СТРОГО JSON без пояснений: "
-    '{"vacancies":[{"i":<индекс>,"tech":["...","..."]}]}'
+    "Ты эксперт по IT-вакансиям. Извлекаешь из вакансий требования ДВУХ видов:\n"
+    "1) Технологии — языки, фреймворки, библиотеки, БД, инструменты, платформы "
+    "(Python, PostgreSQL, Docker, FastAPI, Kubernetes).\n"
+    "2) Навыки и рабочие процессы — конкретные профессиональные компетенции и задачи, "
+    "например: обучение моделей, инференс LLM, формирование датасетов, построение ETL, "
+    "проектирование архитектуры, code review, A/B-тесты, MLOps, дообучение (fine-tuning), RAG.\n"
+    "Для каждой вакансии верни ОБЪЕДИНЁННЫЙ список этих требований. НЕ включай общие soft "
+    "skills (коммуникабельность, ответственность), названия компаний и должностей, фразы "
+    "вроде «будет плюсом». Формулируй кратко и канонично: технологии — общепринятым "
+    "названием, навыки/процессы — коротким термином по-русски (существительное/герундий). "
+    "Ответь СТРОГО JSON без пояснений: "
+    '{"vacancies":[{"i":<индекс>,"items":["...","..."]}]}'
 )
 
 
@@ -165,31 +165,48 @@ def _extract_batch(vacs, max_desc):
     out = {}
     for item in data.get("vacancies", []) if isinstance(data, dict) else []:
         idx = item.get("i")
-        techs = item.get("tech") or []
+        vals = item.get("items") or item.get("tech") or []  # "tech" — совместимость
         if isinstance(idx, int):
-            out[idx] = [t.strip() for t in techs if isinstance(t, str) and t.strip()]
+            out[idx] = [t.strip() for t in vals if isinstance(t, str) and t.strip()]
     return out
 
 
-# --- этап 2: нормализация/слияние синонимов по всему набору -------------------
-_NORM_SYS = (
-    "Ты эксперт по технологиям и языкам программирования. "
-    "Тебе дан список названий технологий, извлечённых из вакансий. Объедини синонимы и "
-    "разные написания к единому каноническому виду (например 'Postgres','постгрес' -> "
-    "'PostgreSQL'; 'js' -> 'JavaScript'; 'k8s' -> 'Kubernetes'). Убери то, что не является "
-    "технологией/инструментом (map в пустую строку). Ответь СТРОГО JSON без пояснений: "
-    '{"map":{"исходное":"канон", ...}} для ВСЕХ входных названий.'
+# --- этап 2: финальное слияние перефразировок и ранжирование самой моделью ----
+# Не считаем частоту по точным строкам (перефразировки разошлись бы). Отдаём модели
+# все извлечённые пункты, а она сама сливает синонимы/перефразировки и сортирует по частоте.
+_RANK_SYS = (
+    "Ты эксперт по IT-вакансиям. Тебе дан список требований (технологии, навыки, рабочие "
+    "процессы), извлечённых из вакансий, с числом вакансий, где встретился каждый пункт. "
+    "Объедини синонимы, разные написания и ПЕРЕФРАЗИРОВКИ одного и того же смысла в один "
+    "пункт, СУММИРУЯ их числа (например 'Postgres'+'постгрес' -> 'PostgreSQL'; "
+    "'обучение моделей'+'тренировка ML-моделей' -> 'Обучение моделей'; "
+    "'инференс'+'inference LLM' -> 'Инференс LLM'). Сохраняй и технологии, и навыки/процессы; "
+    "убери общие soft skills и мусор. Верни ИТОГОВЫЙ список, ОТСОРТИРОВАННЫЙ по убыванию "
+    "частоты. Канон — кратко: технологии общепринято, навыки/процессы по-русски. "
+    "Ответь СТРОГО JSON без пояснений: "
+    '{"ranked":[{"name":"канон","count":<целое>}, ...]}'
 )
 
 
-def _normalize(names):
-    if not names:
-        return {}
-    content = _chat([{"role": "system", "content": _NORM_SYS},
-                     {"role": "user", "content": json.dumps(names, ensure_ascii=False)}])
+def _rank(item_counts):
+    """item_counts: {строка: сколько вакансий содержат}. Возвращает [(канон, count)] по убыванию."""
+    if not item_counts:
+        return []
+    payload = [{"item": k, "count": v}
+               for k, v in sorted(item_counts.items(), key=lambda kv: -kv[1])]
+    content = _chat([{"role": "system", "content": _RANK_SYS},
+                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
     data = _parse_json(content)
-    mapping = data.get("map", {}) if isinstance(data, dict) else {}
-    return {k: v for k, v in mapping.items() if isinstance(v, str)}
+    ranked = data.get("ranked", []) if isinstance(data, dict) else []
+    out = []
+    for r in ranked:
+        if not isinstance(r, dict):
+            continue
+        name = (r.get("name") or "").strip()
+        cnt = r.get("count")
+        if name and isinstance(cnt, (int, float)) and cnt > 0:
+            out.append((name, int(cnt)))
+    return out
 
 
 # --- сборка результата (тот же формат, что extract.aggregate) ----------------
@@ -199,39 +216,31 @@ def aggregate_llm(vacancies, progress=None):
     max_desc = _max_desc()
     total_batches = math.ceil(n / batch) if n else 0
 
-    per_vac = []  # множество технологий на каждую вакансию (этап 1)
+    # этап 1: по каждой вакансии — множество требований
+    seen_counts = Counter()  # сколько вакансий содержат каждую сырую формулировку
     for b in range(total_batches):
         chunk = vacancies[b * batch:(b + 1) * batch]
         if progress:
             progress(f"LLM: разбор батча {b + 1}/{total_batches}…")
         res = _extract_batch(chunk, max_desc)
         for idx in range(len(chunk)):
-            per_vac.append(set(res.get(idx, [])))
+            seen_counts.update(set(res.get(idx, [])))  # set -> одна вакансия = один голос
 
-    # этап 2: нормализация синонимов по всем найденным названиям
-    distinct = sorted({t for s in per_vac for t in s})
-    if progress and distinct:
-        progress("LLM: нормализация результатов…")
-    merge = _normalize(distinct) if distinct else {}
+    # этап 2: модель сама сливает перефразировки и сортирует по частоте
+    if progress and seen_counts:
+        progress("LLM: итоговое слияние и ранжирование…")
+    ranked = _rank(dict(seen_counts))
+    if not ranked:  # модель не вернула — падать не будем, возьмём сырые частоты
+        ranked = sorted(seen_counts.items(), key=lambda kv: -kv[1])
 
-    def canon(t):
-        return merge.get(t, t)  # нет в карте -> оставляем как есть
-
-    per_vac = [{c for c in (canon(t) for t in s) if c} for s in per_vac]
-
-    df = Counter()
-    for s in per_vac:
-        df.update(s)
-    top = {t for t, _ in df.most_common(_cooccur_top_k())}
-    cooccur = Counter()
-    for s in per_vac:
-        for a, b in combinations(sorted(s & top), 2):
-            cooccur[(a, b)] += 1
+    df = {}
+    for name, cnt in ranked:
+        df[name] = min(cnt, n)  # не больше числа вакансий
 
     return {
         "n": n,
-        "df": dict(df),
+        "df": df,
         "source": {t: "llm" for t in df},
-        "cooccur": dict(cooccur),
+        "cooccur": {},  # в LLM-режиме co-occurrence не считаем
         "raw_skills": {},
     }

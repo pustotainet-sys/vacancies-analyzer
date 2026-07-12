@@ -219,8 +219,9 @@ def main_kb():
          InlineKeyboardButton("📋 Вакансии", callback_data="vacs")],
         [InlineKeyboardButton("📈 Тренд за месяц", callback_data="trend"),
          InlineKeyboardButton("🔁 Что изменилось", callback_data="diff")],
+        [InlineKeyboardButton("🧠 Проанализировать заново (LLM)", callback_data="re_llm")],
         [InlineKeyboardButton("⚙️ Фильтры", callback_data="flt"),
-         InlineKeyboardButton("⟳ Собрать сейчас", callback_data="collect")],
+         InlineKeyboardButton("⟳ Загрузить свежие", callback_data="collect")],
     ])
 
 
@@ -276,8 +277,9 @@ HELP = (
     "📈 Тренд за месяц — что выросло/упало/появилось/исчезло\n"
     "🔁 Что изменилось — дифф с прошлого сбора\n"
     "⚙️ Фильтры — регион, период, размер топа, свой запрос\n"
-    "⟳ Собрать сейчас (кнопка) или /refresh — принудительный сбор\n"
-    "/collect_llm — сбор с анализом через LLM; /collect_basic — без LLM\n\n"
+    "⟳ Загрузить свежие (кнопка) или /refresh — скачать свежие вакансии и пересчитать\n"
+    "🧠 Проанализировать заново (LLM) — пересчитать топ по уже загруженным, без hh\n"
+    "/reanalyze_llm, /reanalyze_basic — то же командой (LLM или по словарю)\n\n"
     "По расписанию собирается python/Россия; свой запрос считается «здесь и сейчас», "
     "без истории трендов."
 )
@@ -346,9 +348,14 @@ async def cmd_status(update, context):
                      f"(деталей {L['enriched_count']}); метод: {method}")
     else:
         lines.append("Успешных сборов ещё нет.")
-    llm_state = "включён" if llm.available() else "нет ключа (OPENROUTER_API_KEY)"
-    lines.append(f"LLM: {llm_state}; режим: {os.environ.get('LLM_MODE', 'auto')}")
-    lines.append("Модели (приоритет): " + ", ".join(llm.models()))
+    providers = []
+    if llm.gemini_key():
+        providers.append("Gemini API: " + ", ".join(llm.gemini_models()))
+    if llm.api_key():
+        providers.append("OpenRouter: " + ", ".join(llm.models()))
+    llm_state = "; ".join(providers) if providers else "нет ключей (GEMINI/OPENROUTER)"
+    lines.append(f"LLM режим: {os.environ.get('LLM_MODE', 'auto')}")
+    lines.append("Провайдеры (приоритет): " + llm_state)
     if last and last["status"] == "error":
         lines.append(f"⚠️ Последний сбор с ошибкой: {last['error']}")
     if collector.is_busy():
@@ -379,20 +386,56 @@ async def cmd_refresh(update, context):
     await _collect_active(context, cid)
 
 
-async def cmd_collect_llm(update, context):
-    """Сбор с обязательным анализом через LLM."""
+async def _reanalyze_active(context, chat_id, mode):
+    """Пересчитать топ активного запроса по сохранённым вакансиям — без загрузки из hh."""
+    if collector.is_busy():
+        await context.bot.send_message(chat_id, "Идёт сбор/пересчёт — подождите.")
+        return
+    st = _state(context, chat_id)
+    conn = _conn(context)
+    if not storage.latest_ok_snapshot(conn, st["query_text"], st["area"]):
+        await context.bot.send_message(
+            chat_id, "Нет сохранённых данных для пересчёта. Сначала соберите: ⟳ или /refresh.")
+        return
+    label = {"llm": "LLM", "basic": "базовый"}.get(mode, mode)
+    await context.bot.send_message(
+        chat_id, f"Пересчитываю топ ({label}) по сохранённым вакансиям: "
+                 f"{st['query_text']} / {_area_label(st['area'])}…")
+    loop = asyncio.get_running_loop()
+
+    def progress(msg):
+        asyncio.run_coroutine_threadsafe(context.bot.send_message(chat_id, msg), loop)
+
+    res = await asyncio.to_thread(collector.reanalyze_once, conn,
+                                  st["query_text"], st["area"], mode, progress)
+    status = res.get("status")
+    if status == "ok":
+        await context.bot.send_message(
+            chat_id, f"Готово [{res['method']}]. Пересчитано по {res['n']} вакансиям. "
+                     f"Топ: {', '.join(res['top'])}")
+    elif status == "busy":
+        await context.bot.send_message(chat_id, "Идёт сбор/пересчёт — подождите.")
+    elif status in ("no_data", "no_raw"):
+        await context.bot.send_message(
+            chat_id, "Нет сохранённых вакансий для пересчёта — сначала ⟳ / /refresh.")
+    else:
+        await context.bot.send_message(chat_id, f"Ошибка пересчёта: {res.get('error')}")
+
+
+async def cmd_reanalyze_llm(update, context):
+    """Пересчёт топа через LLM по сохранённым вакансиям (без загрузки из hh)."""
     cid = update.effective_chat.id
     if not _allowed(cid):
         return
-    await _collect_active(context, cid, mode="llm")
+    await _reanalyze_active(context, cid, mode="llm")
 
 
-async def cmd_collect_basic(update, context):
-    """Сбор с базовым анализом (без LLM, по словарю)."""
+async def cmd_reanalyze_basic(update, context):
+    """Пересчёт топа базовым режимом (словарь) по сохранённым вакансиям (без загрузки)."""
     cid = update.effective_chat.id
     if not _allowed(cid):
         return
-    await _collect_active(context, cid, mode="basic")
+    await _reanalyze_active(context, cid, mode="basic")
 
 
 async def cmd_collect(update, context):
@@ -564,6 +607,8 @@ async def on_callback(update, context):
         await _do_trend(context, cid, kind="diff")
     elif data == "collect":
         await _collect_active(context, cid)
+    elif data == "re_llm":
+        await _reanalyze_active(context, cid, mode="llm")
     elif data == "flt":
         st = _state(context, cid)
         await q.edit_message_text(FILTER_TEXT, reply_markup=filter_kb(st))
@@ -630,8 +675,8 @@ async def post_init(app):
         BotCommand("diff", "Что изменилось"),
         BotCommand("filters", "Фильтры"),
         BotCommand("refresh", "Обновить данные (сбор сейчас)"),
-        BotCommand("collect_llm", "Сбор с анализом через LLM"),
-        BotCommand("collect_basic", "Сбор без LLM (по словарю)"),
+        BotCommand("reanalyze_llm", "Пересчитать топ через LLM (без загрузки)"),
+        BotCommand("reanalyze_basic", "Пересчитать топ по словарю (без загрузки)"),
         BotCommand("status", "Статус сбора"),
         BotCommand("help", "Справка"),
     ])
@@ -662,8 +707,8 @@ def main():
     app.add_handler(CommandHandler("filters", cmd_filters))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
-    app.add_handler(CommandHandler("collect_llm", cmd_collect_llm))
-    app.add_handler(CommandHandler("collect_basic", cmd_collect_basic))
+    app.add_handler(CommandHandler("reanalyze_llm", cmd_reanalyze_llm))
+    app.add_handler(CommandHandler("reanalyze_basic", cmd_reanalyze_basic))
     app.add_handler(CommandHandler("collect", cmd_collect))
     app.add_handler(CommandHandler("dict", cmd_dict))
     app.add_handler(CallbackQueryHandler(on_callback))

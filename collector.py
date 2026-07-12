@@ -83,6 +83,50 @@ def _analyze(conn, items, mode, progress):
     return _gazetteer(conn, items), "basic"
 
 
+def _item_from_row(r):
+    """Восстановить вакансию-словарь из сохранённой строки (для пересчёта)."""
+    ks = json.loads(r["key_skills_json"]) if r.get("key_skills_json") else None
+    return {
+        "id": r["vac_id"], "name": r.get("name"),
+        "key_skills": ks, "description": r.get("description"),
+        "snippet": {"requirement": r.get("snippet_req"),
+                    "responsibility": r.get("snippet_resp")},
+        "employer": {"name": r.get("company")},
+        "alternate_url": r.get("alternate_url"),
+        "published_at": r.get("published_at"), "area": {"name": r.get("area")},
+    }
+
+
+def reanalyze_once(conn, query, area, mode, progress=None):
+    """Пересчитать топ последнего снимка по СОХРАНЁННЫМ вакансиям — без обращения к hh.
+
+    Меняет только tech_counts/cooccurrence/method снимка. Возвращает dict со статусом.
+    """
+    if not _guard.acquire(blocking=False):
+        return {"status": "busy"}
+    _busy.set()
+    try:
+        L = storage.latest_ok_snapshot(conn, query, area)
+        if not L:
+            return {"status": "no_data"}
+        rows = storage.raw_vacancies(conn, L["run_id"])
+        if not rows:
+            return {"status": "no_raw"}  # сырьё выпрунено retention'ом
+        items = [_item_from_row(r) for r in rows]
+        result, method = _analyze(conn, items, mode, progress)
+        storage.replace_analysis(conn, L["run_id"], result, method)
+        top = sorted(result["df"].items(), key=lambda kv: -kv[1])[:5]
+        return {"status": "ok", "run_id": L["run_id"], "n": result["n"],
+                "method": method, "top": [t for t, _ in top]}
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[reanalyze] ошибка: {err}", flush=True)
+        return {"status": "error", "error": err}
+    finally:
+        _busy.clear()
+        _guard.release()
+
+
 def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, mode=None):
     """Собрать и записать один снимок. Возвращает dict со статусом.
 

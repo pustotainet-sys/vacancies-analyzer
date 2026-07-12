@@ -32,8 +32,32 @@ def api_key():
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+# модели прямого Gemini API по приоритету: при ошибке (например 503) пробуем следующую
+DEFAULT_GEMINI_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+]
+
+
+def gemini_key():
+    return os.environ.get("GEMINI_API_KEY", "").strip()
+
+
+def gemini_models():
+    """Список моделей Gemini по приоритету. env GEMINI_MODELS (через запятую) переопределяет."""
+    raw = os.environ.get("GEMINI_MODELS", "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    single = os.environ.get("GEMINI_MODEL", "").strip()  # обратная совместимость
+    if single:
+        return [single]
+    return list(DEFAULT_GEMINI_MODELS)
+
+
 def available():
-    return bool(api_key())
+    # LLM доступен, если есть хотя бы один провайдер: прямой Gemini или OpenRouter
+    return bool(gemini_key() or api_key())
 
 
 def models():
@@ -52,7 +76,9 @@ def _log(msg):
 
 
 def _batch_size():
-    # модели с контекстом 120k+; ~1k токенов на вакансию -> ~50 вакансий в батч
+    # Вакансий в батч. Ограничение — лимит ВЫВОДА модели (LLM_MAX_TOKENS), не вход:
+    # каждая вакансия даёт ~15-25 пунктов. У Gemini flash выход до 64K, так что батч
+    # 50-60 помещается, если LLM_MAX_TOKENS достаточно большой.
     return int(os.environ.get("LLM_BATCH_SIZE", "50"))
 
 
@@ -61,17 +87,48 @@ def _max_desc():
 
 
 def _max_tokens():
-    # лимит вывода. Для 50 вакансий JSON-ответ крупнее — берём с запасом.
-    # (у платных моделей слишком большой max_tokens может дать 402 по кредитам.)
-    return int(os.environ.get("LLM_MAX_TOKENS", "8000"))
+    # Лимит вывода модели. Раньше стоял 8000 и РЕЗАЛ ответ на больших батчах.
+    # У Gemini flash выход до 64K, поэтому ставим с запасом под батч 50-60.
+    # (Осторожно с платными моделями OpenRouter: слишком большой -> 402 по кредитам.
+    #  У :free-моделей и прямого Gemini этой проблемы нет.)
+    return int(os.environ.get("LLM_MAX_TOKENS", "32000"))
 
 
-def _chat(messages, temperature=0.0, timeout=180):
-    """Запрос к LLM с перебором моделей по приоритету.
+def _chat_gemini(messages, temperature):
+    """Прямой вызов Gemini API (google-genai) с перебором моделей по приоритету.
 
-    При ошибке модели логируем и переходим к следующей. Если упали все — RuntimeError
-    (выше по стеку это приведёт к откату на базовый режим без LLM).
+    При ошибке модели (например 503 UNAVAILABLE) логируем и пробуем следующую Gemini.
+    Все упали — RuntimeError (выше по стеку -> переход на OpenRouter).
     """
+    from google import genai
+    from google.genai import types
+    system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+    user = "\n\n".join(m["content"] for m in messages if m.get("role") != "system")
+    client = genai.Client()
+    cfg = types.GenerateContentConfig(temperature=temperature,
+                                      max_output_tokens=_max_tokens(),
+                                      system_instruction=system or None)
+    ms = gemini_models()
+    last_err = None
+    for idx, m in enumerate(ms):
+        try:
+            _log(f"Gemini {m} (приоритет {idx + 1}/{len(ms)})")
+            resp = client.models.generate_content(model=m, contents=user, config=cfg)
+            text = resp.text
+            if not text:
+                raise RuntimeError("пустой ответ")
+            if idx > 0:
+                _log(f"успешно на резервной Gemini {m}")
+            return text
+        except Exception as e:
+            last_err = e
+            _log(f"ошибка Gemini {m}: {type(e).__name__}: {str(e)[:150]}")
+            if idx + 1 < len(ms):
+                _log(f"переключаюсь на следующую Gemini: {ms[idx + 1]}")
+    raise RuntimeError(f"все {len(ms)} Gemini-моделей не сработали; последняя: {last_err}")
+
+
+def _chat_openrouter(messages, temperature, timeout):
     key = api_key()
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY не задан")
@@ -79,7 +136,7 @@ def _chat(messages, temperature=0.0, timeout=180):
     last_err = None
     for idx, m in enumerate(ms):
         try:
-            _log(f"запрос к модели {m} (приоритет {idx + 1}/{len(ms)})")
+            _log(f"запрос к OpenRouter {m} (приоритет {idx + 1}/{len(ms)})")
             resp = requests.post(
                 API_URL,
                 headers={"Authorization": f"Bearer {key}",
@@ -100,7 +157,30 @@ def _chat(messages, temperature=0.0, timeout=180):
             _log(f"ошибка модели {m}: {type(e).__name__}{detail}")
             if idx + 1 < len(ms):
                 _log(f"переключаюсь на следующую модель: {ms[idx + 1]}")
-    raise RuntimeError(f"все {len(ms)} моделей не сработали; последняя ошибка: {last_err}")
+    raise RuntimeError(f"OpenRouter: все {len(ms)} моделей не сработали; последняя: {last_err}")
+
+
+def _chat(messages, temperature=0.0, timeout=180):
+    """Запрос к LLM с приоритетом провайдеров: прямой Gemini -> OpenRouter.
+
+    Всё упало — RuntimeError (выше по стеку это приведёт к откату на базовый режим).
+    """
+    errors = []
+    # 1) прямой Gemini API — высший приоритет (со своим перебором моделей)
+    if gemini_key():
+        try:
+            return _chat_gemini(messages, temperature)
+        except Exception as e:
+            errors.append(f"gemini: {type(e).__name__}: {str(e)[:150]}")
+            _log("все Gemini-модели не сработали — переключаюсь на OpenRouter")
+    # 2) OpenRouter (цепочка моделей по приоритету)
+    if api_key():
+        try:
+            return _chat_openrouter(messages, temperature, timeout)
+        except Exception as e:
+            errors.append(str(e)[:200])
+    raise RuntimeError("все провайдеры LLM не сработали: " +
+                       (" | ".join(errors) if errors else "нет ключей (GEMINI_API_KEY/OPENROUTER_API_KEY)"))
 
 
 def _parse_json(text):
@@ -161,13 +241,23 @@ def _extract_batch(vacs, max_desc):
     prompt = "\n\n".join(_vacancy_block(i, v, max_desc) for i, v in enumerate(vacs))
     content = _chat([{"role": "system", "content": _BATCH_SYS},
                      {"role": "user", "content": prompt}])
-    data = _parse_json(content)
     out = {}
+    data = _parse_json(content)
     for item in data.get("vacancies", []) if isinstance(data, dict) else []:
         idx = item.get("i")
         vals = item.get("items") or item.get("tech") or []  # "tech" — совместимость
         if isinstance(idx, int):
             out[idx] = [t.strip() for t in vals if isinstance(t, str) and t.strip()]
+    if not out:
+        # JSON мог быть обрезан по лимиту вывода — спасаем целые объекты вакансий
+        for m in re.finditer(r'"i"\s*:\s*(\d+)\s*,\s*"(?:items|tech)"\s*:\s*\[([^\]]*)\]',
+                             content):
+            idx = int(m.group(1))
+            vals = re.findall(r'"([^"]+)"', m.group(2))
+            out[idx] = [t.strip() for t in vals if t.strip()]
+        if out:
+            _log(f"ответ был обрезан — спасено вакансий: {len(out)} "
+                 "(уменьшите LLM_BATCH_SIZE)")
     return out
 
 

@@ -245,6 +245,33 @@ def snapshot_vacancies(conn, run_id, limit):
     return [dict(r) for r in rows]
 
 
+def raw_vacancies(conn, run_id):
+    """Все сохранённые сырые вакансии снимка (для пересчёта без обращения к hh)."""
+    with _LOCK:
+        rows = conn.execute("SELECT * FROM vacancies WHERE run_id=?", (run_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def replace_analysis(conn, run_id, result, method):
+    """Заменить топ (tech_counts + cooccurrence + method) снимка на пересчитанный.
+
+    Сырьё vacancies и метка времени не трогаются — это тот же сбор, просто пере-анализ.
+    """
+    n = result["n"] or 1
+    with _LOCK:
+        conn.execute("DELETE FROM tech_counts WHERE run_id=?", (run_id,))
+        conn.execute("DELETE FROM cooccurrence WHERE run_id=?", (run_id,))
+        conn.executemany(
+            "INSERT INTO tech_counts(run_id, tech, df, share, source) VALUES(?,?,?,?,?)",
+            [(run_id, t, df, df / n, result["source"].get(t, "text"))
+             for t, df in result["df"].items()])
+        conn.executemany(
+            "INSERT INTO cooccurrence(run_id, tech_a, tech_b, cnt) VALUES(?,?,?,?)",
+            [(run_id, a, b, c) for (a, b), c in result["cooccur"].items()])
+        conn.execute("UPDATE snapshots SET method=? WHERE run_id=?", (method, run_id))
+        conn.commit()
+
+
 def get_vacancy(conn, vac_id):
     """Последняя сохранённая версия вакансии по vac_id (для показа деталей)."""
     with _LOCK:

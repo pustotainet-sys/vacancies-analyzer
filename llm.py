@@ -13,6 +13,7 @@ import math
 import os
 import re
 from collections import Counter
+from datetime import datetime
 
 import requests
 
@@ -92,6 +93,42 @@ def _max_tokens():
     # (Осторожно с платными моделями OpenRouter: слишком большой -> 402 по кредитам.
     #  У :free-моделей и прямого Gemini этой проблемы нет.)
     return int(os.environ.get("LLM_MAX_TOKENS", "32000"))
+
+
+def _dump_dir():
+    # Куда складывать сырой результат этапа 1. LLM_DUMP=0 полностью выключает дамп.
+    if os.environ.get("LLM_DUMP", "1").strip() in ("0", "false", "no"):
+        return None
+    return os.environ.get("LLM_DUMP_DIR", "llm_dumps").strip() or None
+
+
+def _open_dump(n, total_batches):
+    """Открыть JSONL-файл под сырые результаты первой фазы. None — дамп выключен/не открылся."""
+    d = _dump_dir()
+    if not d:
+        return None
+    try:
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"phase1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
+        f = open(path, "w", encoding="utf-8")
+    except OSError as e:
+        _log(f"не удалось открыть файл дампа: {e}")
+        return None
+    _dump_write(f, {"type": "meta", "vacancies": n, "batches": total_batches,
+                    "batch_size": _batch_size(), "max_desc": _max_desc(),
+                    "started": datetime.now().isoformat(timespec="seconds")})
+    _log(f"сырые результаты первой фазы: {path}")
+    return f
+
+
+def _dump_write(f, obj):
+    if not f:
+        return
+    try:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()  # чтобы файл был пригоден для анализа даже при падении на середине
+    except OSError as e:
+        _log(f"ошибка записи дампа: {e}")
 
 
 def _chat_gemini(messages, temperature):
@@ -308,13 +345,29 @@ def aggregate_llm(vacancies, progress=None):
 
     # этап 1: по каждой вакансии — множество требований
     seen_counts = Counter()  # сколько вакансий содержат каждую сырую формулировку
-    for b in range(total_batches):
-        chunk = vacancies[b * batch:(b + 1) * batch]
-        if progress:
-            progress(f"LLM: разбор батча {b + 1}/{total_batches}…")
-        res = _extract_batch(chunk, max_desc)
-        for idx in range(len(chunk)):
-            seen_counts.update(set(res.get(idx, [])))  # set -> одна вакансия = один голос
+    dump = _open_dump(n, total_batches)
+    try:
+        for b in range(total_batches):
+            chunk = vacancies[b * batch:(b + 1) * batch]
+            if progress:
+                progress(f"LLM: разбор батча {b + 1}/{total_batches}…")
+            res = _extract_batch(chunk, max_desc)
+            for idx in range(len(chunk)):
+                items = res.get(idx, [])
+                seen_counts.update(set(items))  # set -> одна вакансия = один голос
+                v = chunk[idx]
+                _dump_write(dump, {
+                    "type": "vacancy", "batch": b + 1, "i": b * batch + idx,
+                    "id": v.get("id"), "name": v.get("name"),
+                    "url": v.get("alternate_url"),
+                    "employer": (v.get("employer") or {}).get("name"),
+                    "items": items,
+                })
+        _dump_write(dump, {"type": "raw_counts",
+                           "counts": dict(seen_counts.most_common())})
+    finally:
+        if dump:
+            dump.close()
 
     # этап 2: модель сама сливает перефразировки и сортирует по частоте
     if progress and seen_counts:

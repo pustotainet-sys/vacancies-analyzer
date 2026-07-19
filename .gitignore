@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 vacancies_*.json
 vacancies_*.csv
+llm_dumps/

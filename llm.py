@@ -23,7 +23,7 @@ API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # перечень моделей по приоритету: при ошибке пробуем следующую
 DEFAULT_MODELS = [
-    "openai/gpt-oss-120b:free",
+    "poolside/laguna-xs-2.1:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
     "cohere/north-mini-code:free",
 ]
@@ -96,8 +96,9 @@ def _max_tokens():
 
 
 def _dump_dir():
-    # Куда складывать сырой результат этапа 1. LLM_DUMP=0 полностью выключает дамп.
-    if os.environ.get("LLM_DUMP", "1").strip() in ("0", "false", "no"):
+    # Куда складывать сырой результат этапа 1. По умолчанию выключено: при многих
+    # пользователях дамп пишется на каждую задачу и каталог растёт неограниченно.
+    if os.environ.get("LLM_DUMP", "0").strip() not in ("1", "true", "yes"):
         return None
     return os.environ.get("LLM_DUMP_DIR", "llm_dumps").strip() or None
 

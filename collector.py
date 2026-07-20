@@ -1,14 +1,16 @@
 """Один прогон сбора: N свежих вакансий -> детали -> извлечение -> запись.
 
 Деталь /vacancies/{id} — основной сигнал (description + key_skills). Объём
-ограничен analyze_top_n. Guard не даёт прогонам пересекаться (ручной + фоновый).
+ограничен analyze_top_n. Прогоны идут параллельно (несколько воркеров очереди),
+но два узких места разделены семафорами: сеть к hh — общий токен и один IP,
+поэтому HH_CONCURRENCY=1; анализ LLM — LLM_CONCURRENCY. Пока одна задача
+считается моделью, другая качает вакансии.
 """
 
 import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
 
 import requests
 
@@ -18,8 +20,8 @@ import skills_dict
 import storage
 from hh_vacancies import API_URL, build_session, fetch_vacancies
 
-_guard = threading.Lock()          # неблокирующий захват -> отсечь параллельный прогон
-_busy = threading.Event()
+_hh_sem = threading.Semaphore(int(os.environ.get("HH_CONCURRENCY", "1")))
+_llm_sem = threading.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "2")))
 
 
 def fetch_vacancy_detail(session, vac_id, timeout=30):
@@ -71,15 +73,16 @@ def _analyze(conn, items, mode, progress):
     if want_llm:
         if not llm.available():
             if progress:
-                progress("OPENROUTER_API_KEY не задан — использую базовый режим…")
+                progress("Ключ LLM не задан — использую базовый режим…")
             return _gazetteer(conn, items), "basic (нет ключа LLM)"
-        try:
-            return llm.aggregate_llm(items, progress=progress), "llm"
-        except Exception as e:
-            if progress:
-                progress(f"LLM недоступен ({type(e).__name__}) — базовый режим…")
-            print(f"[collect] LLM ошибка: {e}", flush=True)
-            return _gazetteer(conn, items), "basic (откат с LLM)"
+        with _llm_sem:
+            try:
+                return llm.aggregate_llm(items, progress=progress), "llm"
+            except Exception as e:
+                if progress:
+                    progress(f"LLM недоступен ({type(e).__name__}) — базовый режим…")
+                print(f"[collect] LLM ошибка: {e}", flush=True)
+                return _gazetteer(conn, items), "basic (откат с LLM)"
     return _gazetteer(conn, items), "basic"
 
 
@@ -102,9 +105,6 @@ def reanalyze_once(conn, query, area, mode, progress=None):
 
     Меняет только tech_counts/cooccurrence/method снимка. Возвращает dict со статусом.
     """
-    if not _guard.acquire(blocking=False):
-        return {"status": "busy"}
-    _busy.set()
     try:
         L = storage.latest_ok_snapshot(conn, query, area)
         if not L:
@@ -122,9 +122,6 @@ def reanalyze_once(conn, query, area, mode, progress=None):
         err = f"{type(e).__name__}: {str(e)[:200]}"
         print(f"[reanalyze] ошибка: {err}", flush=True)
         return {"status": "error", "error": err}
-    finally:
-        _busy.clear()
-        _guard.release()
 
 
 def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, mode=None):
@@ -132,54 +129,53 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
 
     progress(msg) — необязательный колбэк, вызывается только когда реально начинается
     догрузка новых вакансий (не при работе из кэша). Итог/ошибку сообщает вызывающий
-    по возвращённому dict. Не пересекается с другим прогоном (status='busy').
+    по возвращённому dict.
     """
-    if not _guard.acquire(blocking=False):
-        return {"status": "busy"}
-    _busy.set()
     t0 = time.monotonic()
     session = None
     try:
-        session = build_session()
-        # search_field пуст -> hh ищет по всем полям (как на сайте); можно сузить
-        # через HH_SEARCH_FIELD=name (только по названию).
-        search_field = os.environ.get("HH_SEARCH_FIELD") or None
-        items, total_found = fetch_vacancies(
-            session, query, area, per_page=100, max_items=analyze_top_n,
-            extra_params={"order_by": "publication_time"}, search_field=search_field)
+        with _hh_sem:  # сеть к hh — строго последовательно: общий токен приложения и один IP
+            session = build_session()
+            # search_field пуст -> hh ищет по всем полям (как на сайте); можно сузить
+            # через HH_SEARCH_FIELD=name (только по названию).
+            search_field = os.environ.get("HH_SEARCH_FIELD") or None
+            items, total_found = fetch_vacancies(
+                session, query, area, per_page=100, max_items=analyze_top_n,
+                extra_params={"order_by": "publication_time"}, search_field=search_field)
 
-        total = len(items)
-        # детали уже виденных вакансий берём из БД — по сети тянем только новые
-        cached = storage.stored_details(conn, [str(v["id"]) for v in items])
-        new_items = [v for v in items if str(v["id"]) not in cached]
-        print(f"[collect] вакансий: {total}; из БД: {len(cached)}; новых к загрузке: "
-              f"{len(new_items)} (~{len(new_items) * (throttle + 0.15):.0f}с)…", flush=True)
-        # сообщаем пользователю только если реально идёт догрузка новых вакансий
-        if new_items and progress:
-            progress(f"Догружаю {len(new_items)} новых вакансий…")
+            total = len(items)
+            # детали уже виденных вакансий берём из БД — по сети тянем только новые
+            cached = storage.stored_details(conn, [str(v["id"]) for v in items])
+            new_items = [v for v in items if str(v["id"]) not in cached]
+            print(f"[collect] вакансий: {total}; из БД: {len(cached)}; новых к загрузке: "
+                  f"{len(new_items)} (~{len(new_items) * (throttle + 0.15):.0f}с)…", flush=True)
+            # сообщаем пользователю только если реально идёт догрузка новых вакансий
+            if new_items and progress:
+                progress(f"Догружаю {len(new_items)} новых вакансий…")
 
-        enriched, reused, done = 0, 0, 0
-        for v in items:
-            vid = str(v["id"])
-            if vid in cached:
-                c = cached[vid]
-                v["description"] = c["description"]
-                v["key_skills"] = json.loads(c["key_skills_json"]) if c["key_skills_json"] else None
-                reused += 1
-                enriched += 1
-                continue
-            try:
-                detail = fetch_vacancy_detail(session, vid)
-                v["description"] = detail.get("description")
-                v["key_skills"] = detail.get("key_skills")
-                enriched += 1
-                if throttle:
-                    time.sleep(throttle)
-            except requests.RequestException:
-                pass  # деталь не загрузилась — останется сниппет как fallback
-            done += 1
-            if new_items and (done % 25 == 0 or done == len(new_items)):
-                print(f"[collect]   новых деталей {done}/{len(new_items)}", flush=True)
+            enriched, reused, done = 0, 0, 0
+            for v in items:
+                vid = str(v["id"])
+                if vid in cached:
+                    c = cached[vid]
+                    v["description"] = c["description"]
+                    v["key_skills"] = (json.loads(c["key_skills_json"])
+                                       if c["key_skills_json"] else None)
+                    reused += 1
+                    enriched += 1
+                    continue
+                try:
+                    detail = fetch_vacancy_detail(session, vid)
+                    v["description"] = detail.get("description")
+                    v["key_skills"] = detail.get("key_skills")
+                    enriched += 1
+                    if throttle:
+                        time.sleep(throttle)
+                except requests.RequestException:
+                    pass  # деталь не загрузилась — останется сниппет как fallback
+                done += 1
+                if new_items and (done % 25 == 0 or done == len(new_items)):
+                    print(f"[collect]   новых деталей {done}/{len(new_items)}", flush=True)
 
         result, method = _analyze(conn, items, mode, progress)
 
@@ -192,7 +188,7 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
         run_id = storage.write_snapshot(conn, meta, result, raw_rows)
         skill_map = skills_dict.merged_with_learned(storage.learned_map(conn))
         storage.upsert_learned(conn, result["raw_skills"], _known_aliases(skill_map))
-        storage.prune_raw(conn, _retention_days())
+        storage.prune_raw(conn, _retention_days(), _adhoc_retention_days())
 
         top = sorted(result["df"].items(), key=lambda kv: -kv[1])[:10]
         return {"status": "ok", "run_id": run_id, "n": result["n"], "method": method,
@@ -218,14 +214,12 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
         err = f"{type(e).__name__}: {str(e)[:200]}"
         storage.write_error_snapshot(conn, query, area, err)
         return {"status": "error", "error": err}
-    finally:
-        _busy.clear()
-        _guard.release()
-
-
-def is_busy():
-    return _busy.is_set()
 
 
 def _retention_days():
     return int(os.environ.get("RETENTION_RAW_DAYS", "90"))
+
+
+def _adhoc_retention_days():
+    """Сырьё разовых запросов живёт коротко: истории по ним всё равно не копится."""
+    return int(os.environ.get("RETENTION_ADHOC_DAYS", "7"))

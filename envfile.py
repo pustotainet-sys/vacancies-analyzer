@@ -2,13 +2,29 @@
 
 Приоритет: значения из .env перекрывают переменные окружения (override=True),
 переменные окружения остаются фолбэком для ключей, которых в .env нет.
-Формат строк: KEY=VALUE, поддержаны пустые строки, комментарии (#), префикс
-`export ` и обрамляющие кавычки.
+Формат строк: KEY=VALUE, поддержаны пустые строки, комментарии (#) — в том числе
+хвостовые (`KEY=value  # пояснение`, как в .env.example), префикс `export ` и
+обрамляющие кавычки. Значение с символом # сохраняется, если взято в кавычки.
 """
 
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _strip_comment(val):
+    """Снять обрамляющие кавычки или отрезать хвостовой комментарий.
+
+    Кавычки важнее: в них # — часть значения. Без кавычек комментарием считается
+    только `#` после пробела, иначе пострадали бы ключи и пароли с решёткой.
+    """
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        return val[1:-1]
+    for sep in (" #", "\t#"):
+        pos = val.find(sep)
+        if pos != -1:
+            val = val[:pos]
+    return val.strip()
 
 
 def load(path=None, override=True):
@@ -29,8 +45,7 @@ def load(path=None, override=True):
             key, val = key.strip(), val.strip()
             if not key:
                 continue
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-                val = val[1:-1]
+            val = _strip_comment(val)
             if override or key not in os.environ:
                 os.environ[key] = val
                 loaded[key] = val

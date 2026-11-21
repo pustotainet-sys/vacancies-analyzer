@@ -184,9 +184,18 @@ def _chat_openrouter(messages, temperature, timeout):
                 timeout=timeout,
             )
             resp.raise_for_status()
+            body = resp.json()
+            choice = body["choices"][0]
+            content = choice["message"].get("content")
+            selected_model = body.get("model") or m
+            finish_reason = choice.get("finish_reason")
+            _log(f"OpenRouter выбрал {selected_model}; finish_reason={finish_reason}")
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError(f"пустой текст от {selected_model}; "
+                                   f"finish_reason={finish_reason}")
             if idx > 0:
                 _log(f"успешно на резервной модели {m}")
-            return resp.json()["choices"][0]["message"]["content"]
+            return content
         except Exception as e:
             detail = ""
             if isinstance(e, requests.HTTPError) and e.response is not None:

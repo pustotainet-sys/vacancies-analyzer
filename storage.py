@@ -132,6 +132,14 @@ def init_schema(conn):
                          "SELECT chat_id, query_text, area, COALESCE(updated_at, '') "
                          "FROM chat_state")
             conn.execute("INSERT INTO meta(key, value) VALUES('saved_filters_seeded', '1')")
+        # Ранее новый чат автоматически получал python как активный запрос.
+        # Если пользователь его не сохранял и не отслеживал, начать с пустого выбора.
+        conn.execute(
+            "UPDATE chat_state SET query_text='' WHERE query_text='python' "
+            "AND NOT EXISTS (SELECT 1 FROM saved_filters f WHERE f.chat_id=chat_state.chat_id) "
+            "AND NOT EXISTS (SELECT 1 FROM tracked_queries t "
+            "WHERE t.chat_id=chat_state.chat_id AND t.query_text=chat_state.query_text "
+            "AND t.area=chat_state.area)")
         # Очистить подписки, оставшиеся у заблокированных до исправления /ban.
         conn.execute("DELETE FROM tracked_queries WHERE chat_id IN "
                      "(SELECT chat_id FROM users WHERE status='banned')")

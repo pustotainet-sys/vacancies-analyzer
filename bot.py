@@ -66,7 +66,7 @@ TRACK_SWEEP_SECONDS = 900
 QUERY_MAX_LEN = 64
 
 AREA_NAMES = {"all": "Весь мир", "113": "Россия", "1": "Москва", "2": "СПб"}
-STATE_DEFAULTS = {"query_text": DEFAULT_QUERY, "area": DEFAULT_AREA,
+STATE_DEFAULTS = {"query_text": "", "area": DEFAULT_AREA,
                   "period_days": PERIOD_DEFAULT, "top_n": TOP_N_DEFAULT}
 AWAIT_TEXT = 1    # состояние ConversationHandler: свой запрос
 AWAIT_INVITE = 2  # состояние ConversationHandler: инвайт-код при регистрации
@@ -362,8 +362,7 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
     a, p, n, q = state["area"], state["period_days"], state["top_n"], state["query_text"]
     track_label = "📌 Отслеживается — снять" if tracked else "📌 Отслеживать этот запрос"
     current_saved = (q, str(a)) in saved_filters
-    query_row = [InlineKeyboardButton(_mark(q, "python", "python"),
-                                     callback_data="text:python")]
+    query_row = []
     if current_saved:
         query_row.append(InlineKeyboardButton(f"✏️ {q[:24]}", callback_data="edit_filter"))
     rows = [
@@ -375,9 +374,10 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
         [InlineKeyboardButton(_mark(n, 10, "топ-10"), callback_data="topn:10"),
          InlineKeyboardButton(_mark(n, 15, "топ-15"), callback_data="topn:15"),
          InlineKeyboardButton(_mark(n, 30, "топ-30"), callback_data="topn:30")],
-        query_row,
         [InlineKeyboardButton("➕ Новый запрос", callback_data="text:custom")],
     ]
+    if query_row:
+        rows.insert(3, query_row)
     for index, (query, area) in enumerate(saved_filters):
         pin = "📌 " if (query, str(area)) in tracked_filters else ""
         label = f"{pin}{query} / {_area_label(area)}"
@@ -385,9 +385,10 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
             label = "• " + label
         rows.append([InlineKeyboardButton(
             label[:60], callback_data=f"saved:{index}:{_saved_filter_token(query, area)}")])
-    rows.extend([[InlineKeyboardButton(track_label, callback_data="track")],
-                 [InlineKeyboardButton("🗑 Удалить текущий фильтр", callback_data="delete_filter")],
-                 [InlineKeyboardButton("⬅️ Назад", callback_data="home")]])
+    if current_saved:
+        rows.extend([[InlineKeyboardButton(track_label, callback_data="track")],
+                     [InlineKeyboardButton("🗑 Удалить текущий фильтр", callback_data="delete_filter")]])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -438,8 +439,10 @@ def _change_selected_area(context, chat_id, new_area):
             return "selected"
         return _rename_saved_filter(context, chat_id, query, old_area, query, new_area)
     storage.set_chat_state(conn, chat_id, area=new_area)
-    storage.save_filter(conn, chat_id, query, new_area)
-    return "created"
+    if query:
+        storage.save_filter(conn, chat_id, query, new_area)
+        return "created"
+    return "selected"
 
 
 def _select_python_filter(context, chat_id):
@@ -461,13 +464,13 @@ def _select_remaining_filter(context, chat_id):
         query, area = next(((query, area) for query, area in saved if query == "python"),
                            saved[0])
     else:
-        query, area = DEFAULT_QUERY, DEFAULT_AREA
+        query, area = "", DEFAULT_AREA
     storage.set_chat_state(conn, chat_id, query_text=query, area=area)
 
 
 MENU_TEXT = ("Анализ требований вакансий hh.ru.\n"
              "Выберите действие:")
-FILTER_TEXT = "Фильтры анализа (• — выбрано):"
+FILTER_TEXT = "Фильтры анализа (• — выбрано). Если список пуст, создайте запрос:"
 
 
 # --- доступ к соединению -----------------------------------------------------
@@ -560,7 +563,9 @@ async def cmd_status(update, context):
     queued, running = jobs.queue_depth(conn)
     left_user, left_global = storage.llm_quota_left(conn, cid, LLM_QUOTA_USER, LLM_QUOTA_GLOBAL)
     tracked = jobs.user_tracked(conn, cid)
-    lines = [f"Ваш активный запрос: {st['query_text']} / {_area_label(st['area'])}"]
+    selected_query = (f"{st['query_text']} / {_area_label(st['area'])}"
+                      if st["query_text"] else "не выбран")
+    lines = [f"Ваш активный запрос: {selected_query}"]
     if L:
         method = L["method"] if "method" in L.keys() and L["method"] else "?"
         lines.append(f"Последний сбор: {L['ts_msk']}; вакансий {L['vacancy_count']} "
@@ -627,6 +632,9 @@ async def _submit(context, chat_id, kind, query_text, area, mode=None, announce=
     Квота списывается только за НОВУЮ llm-задачу: подписка на чужую уже идущую
     работу расхода не создаёт, поэтому не тарифицируется.
     """
+    if not query_text:
+        await context.bot.send_message(chat_id, "Сначала создайте фильтр: ⚙️ Фильтры → ➕ Новый запрос.")
+        return False
     conn = _conn(context)
     effective = (mode or os.environ.get("LLM_MODE", "auto")).lower()
     wants_llm = effective in ("llm", "auto") and llm.available()
@@ -671,6 +679,9 @@ async def cmd_refresh(update, context):
 async def _reanalyze_active(context, chat_id, mode):
     """Пересчитать топ активного запроса по сохранённым вакансиям — без загрузки из hh."""
     st = _state(context, chat_id)
+    if not st["query_text"]:
+        await context.bot.send_message(chat_id, "Сначала создайте фильтр: ⚙️ Фильтры → ➕ Новый запрос.")
+        return
     conn = _conn(context)
     if not storage.latest_ok_snapshot(conn, st["query_text"], st["area"]):
         await context.bot.send_message(
@@ -706,6 +717,9 @@ async def _do_track(context, chat_id):
     conn = _conn(context)
     st = _state(context, chat_id)
     query, area = st["query_text"], str(st["area"])
+    if not query:
+        await context.bot.send_message(chat_id, "Сначала создайте фильтр: ⚙️ Фильтры → ➕ Новый запрос.")
+        return
     mine = [(q, str(a)) for q, a in jobs.user_tracked(conn, chat_id)]
     if (query, area) in mine:
         jobs.untrack(conn, query, area, chat_id)
@@ -845,6 +859,9 @@ async def _ensure_snapshot(context, chat_id, st):
     ставим в очередь и дошлём. Снимка нет — ставим в очередь и говорить показывать
     нечего. Возвращает True, если что-то уже можно показать.
     """
+    if not st["query_text"]:
+        await context.bot.send_message(chat_id, "Сначала создайте фильтр: ⚙️ Фильтры → ➕ Новый запрос.")
+        return False
     conn = _conn(context)
     snap = storage.latest_ok_snapshot(conn, st["query_text"], st["area"])
     age = _snapshot_age(snap)
@@ -894,6 +911,9 @@ async def _do_vacancy_detail(context, chat_id, vac_id):
 
 async def _do_trend(context, chat_id, kind):
     st = _state(context, chat_id)
+    if not st["query_text"]:
+        await context.bot.send_message(chat_id, "Сначала создайте фильтр: ⚙️ Фильтры → ➕ Новый запрос.")
+        return
     conn = _conn(context)
     if kind == "diff":
         res = analysis.diff_since_last(conn, st["query_text"], st["area"], st["top_n"])
@@ -990,7 +1010,9 @@ async def on_callback(update, context):
         field = {"area": "area", "period": "period_days", "topn": "top_n",
                  "text": "query_text"}.get(key)
         if field == "query_text":
-            _select_python_filter(context, cid)
+            await q.answer("Кнопка устарела. Создайте свой запрос через ➕ Новый запрос.",
+                           show_alert=True)
+            return
         elif field in ("period_days", "top_n"):
             storage.set_chat_state(_conn(context), cid, **{field: int(val)})
         elif field == "area":

@@ -351,24 +351,44 @@ def test_saved_filters_are_buttons_with_selected_pair(conn):
     assert saved[1].callback_data.endswith(bot._saved_filter_token("golang", "1")), (
         f"неверная привязка кнопки: {saved[1].callback_data}")
     query_buttons = keyboard.inline_keyboard[3]
-    assert query_buttons[0].text == "python", query_buttons
-    assert query_buttons[1].text == "✏️ golang", query_buttons
-    assert query_buttons[1].callback_data == "edit_filter", query_buttons
+    assert query_buttons[0].text == "✏️ golang", query_buttons
+    assert query_buttons[0].callback_data == "edit_filter", query_buttons
     assert any(button.callback_data == "text:custom"
                for row in keyboard.inline_keyboard for button in row), (
         "после выбора существующего фильтра пропала возможность создать новый")
 
 
-def test_default_query_is_marked_in_filter_row():
+def test_new_user_has_no_default_filter():
     # Arrange
     import bot
-    state = {"query_text": "python", "area": "113", "period_days": 30, "top_n": 15}
+    state = dict(bot.STATE_DEFAULTS)
     # Act
-    query_buttons = bot.filter_kb(state).inline_keyboard[3]
+    keyboard = bot.filter_kb(state)
     # Assert
-    assert query_buttons[0].text == "• python", query_buttons
-    assert len(query_buttons) == 1, query_buttons
-    assert bot.filter_kb(state).inline_keyboard[4][0].text == "➕ Новый запрос"
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert state["query_text"] == "", state
+    assert not any("python" in button.text.lower() for button in buttons), buttons
+    assert not any(button.callback_data in ("track", "delete_filter") for button in buttons), buttons
+    assert any(button.callback_data == "text:custom" for button in buttons), buttons
+
+
+def test_old_unsaved_default_is_cleared_on_startup(conn):
+    # Arrange
+    import bot
+    storage.register_user(conn, 1)
+    storage.register_user(conn, 2)
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.get_chat_state(conn, 2, bot.STATE_DEFAULTS)
+    storage.set_chat_state(conn, 1, query_text="python")
+    storage.set_chat_state(conn, 2, query_text="python")
+    storage.save_filter(conn, 2, "python", "113")
+    # Act
+    storage.init_schema(conn)
+    # Assert
+    assert storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)["query_text"] == "", (
+        "несохранённый начальный запрос должен исчезнуть")
+    assert storage.get_chat_state(conn, 2, bot.STATE_DEFAULTS)["query_text"] == "python", (
+        "сохранённый фильтр пользователя нельзя удалять")
 
 
 def test_change_region_replaces_saved_filter_and_preserves_tracking(conn, monkeypatch):
@@ -437,7 +457,7 @@ def test_delete_uses_default_only_when_no_saved_filters_remain(conn):
     bot._select_remaining_filter(context, 1)
     state = storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
     # Assert
-    assert (state["query_text"], state["area"]) == (bot.DEFAULT_QUERY, bot.DEFAULT_AREA), state
+    assert (state["query_text"], state["area"]) == ("", bot.DEFAULT_AREA), state
 
 
 def test_python_filter_can_move_to_world(conn, monkeypatch):
@@ -445,6 +465,7 @@ def test_python_filter_can_move_to_world(conn, monkeypatch):
     import bot
     storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
     storage.save_filter(conn, 1, "python", "113")
+    storage.set_chat_state(conn, 1, query_text="python")
     jobs.track(conn, "python", "113", 0)
     jobs.track(conn, "python", "113", 1)
     monkeypatch.setattr(bot, "_wake_workers", lambda context: None)

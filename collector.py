@@ -18,7 +18,7 @@ import extract
 import llm
 import skills_dict
 import storage
-from hh_vacancies import API_URL, build_session, fetch_vacancies
+from hh_vacancies import API_URL, build_session, fetch_relevant_vacancies, fetch_vacancies
 
 _hh_sem = threading.Semaphore(int(os.environ.get("HH_CONCURRENCY", "1")))
 _llm_sem = threading.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "2")))
@@ -136,14 +136,17 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
     try:
         with _hh_sem:  # сеть к hh — строго последовательно: общий токен приложения и один IP
             session = build_session()
-            # Ищем по названию и описанию, исключая название компании: иначе
-            # «системная аналитика» находит врачей из «Аналитик-Центр».
-            search_field = [field.strip() for field in
-                            os.environ.get("HH_SEARCH_FIELD", "name,description").split(",")
-                            if field.strip()] or None
-            items, total_found = fetch_vacancies(
-                session, query, area, per_page=100, max_items=analyze_top_n,
-                extra_params={"order_by": "relevance"}, search_field=search_field)
+            # Пользовательская настройка HH_SEARCH_FIELD оставляет одиночный поиск.
+            # По умолчанию название имеет приоритет, описание дополняет выборку.
+            if "HH_SEARCH_FIELD" in os.environ:
+                search_field = [field.strip() for field in
+                                os.environ["HH_SEARCH_FIELD"].split(",") if field.strip()] or None
+                items, total_found = fetch_vacancies(
+                    session, query, area, per_page=100, max_items=analyze_top_n,
+                    extra_params={"order_by": "relevance"}, search_field=search_field)
+            else:
+                items, total_found = fetch_relevant_vacancies(
+                    session, query, area, per_page=100, max_items=analyze_top_n)
 
             total = len(items)
             # детали уже виденных вакансий берём из БД — по сети тянем только новые

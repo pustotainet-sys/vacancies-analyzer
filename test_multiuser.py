@@ -555,27 +555,57 @@ def test_hh_search_region_parameters(monkeypatch, area, expected_area):
         f"для {area} ожидался area={expected_area}, получено {actual_area}")
 
 
-def test_collector_searches_titles_and_descriptions_by_relevance(conn, monkeypatch):
+def test_collector_uses_ranked_search(conn, monkeypatch):
     # Arrange
     import collector
     seen = {}
     monkeypatch.delenv("HH_SEARCH_FIELD", raising=False)
     monkeypatch.setattr(collector, "build_session", lambda: None)
 
-    def fake_fetch(session, text, area, per_page, max_items, extra_params, search_field):
-        seen.update({"text": text, "order": extra_params["order_by"],
-                     "field": search_field})
+    def fake_fetch(session, text, area, per_page, max_items):
+        seen.update({"text": text, "limit": max_items})
         return [], 0
 
-    monkeypatch.setattr(collector, "fetch_vacancies", fake_fetch)
+    monkeypatch.setattr(collector, "fetch_relevant_vacancies", fake_fetch)
     monkeypatch.setattr(collector, "_analyze", lambda conn, items, mode, progress: (
         _result(0, {}), "basic"))
     # Act
     outcome = collector.collect_once(conn, "системная аналитика", "113", 100)
     # Assert
     assert outcome["status"] == "ok", outcome
-    assert seen == {"text": "системная аналитика", "order": "relevance",
-                    "field": ["name", "description"]}, seen
+    assert seen == {"text": "системная аналитика", "limit": 100}, seen
+
+
+def test_ranked_search_prefers_titles_and_deduplicates(monkeypatch):
+    # Arrange
+    import hh_vacancies
+    calls = []
+
+    def fake_fetch(session, text, area, per_page, max_items, extra_params, search_field):
+        calls.append((text, max_items, extra_params["order_by"], search_field))
+        if search_field == "name":
+            return [{"id": "title-1"}, {"id": "shared"}], 30
+        return [{"id": "shared"}, {"id": "description-1"}], 40
+
+    monkeypatch.setattr(hh_vacancies, "fetch_vacancies", fake_fetch)
+    # Act
+    vacancies, found = hh_vacancies.fetch_relevant_vacancies(
+        None, "системная аналитика", "113", 100, 10)
+    # Assert
+    assert [vacancy["id"] for vacancy in vacancies] == [
+        "title-1", "shared", "description-1"], vacancies
+    assert found == 40, found
+    assert calls == [("системная аналитика", 8, "relevance", "name"),
+                     ('"системная аналитика"', 10, "relevance", "description")], calls
+
+
+def test_ondemand_collection_limit_is_200():
+    # Arrange
+    import bot
+    # Act
+    size = bot._top_n_for("системная аналитика", "113")
+    # Assert
+    assert size == 200, size
 
 
 def test_hh_encodes_multiple_search_fields(monkeypatch):

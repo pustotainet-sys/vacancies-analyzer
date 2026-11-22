@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import httpx2
 import pytest
 import requests
 from google import genai
@@ -27,6 +28,17 @@ class FakeGeminiError(Exception):
     def __init__(self, code):
         super().__init__(f"HTTP {code}")
         self.code = code
+
+
+class FakeGeminiClient:
+    def __init__(self, models):
+        self.models = models
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        return False
 
 
 def _response(model, content):
@@ -101,7 +113,7 @@ def test_gemini_retries_503_twice_then_succeeds(monkeypatch):
             return SimpleNamespace(text="OK")
 
     monkeypatch.setenv("GEMINI_MODELS", "gemini/test")
-    monkeypatch.setattr(genai, "Client", lambda: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(genai, "Client", lambda **kwargs: FakeGeminiClient(FakeModels()))
     monkeypatch.setattr(llm.time, "sleep", lambda seconds: None)
 
     assert llm._chat_gemini([{"role": "user", "content": "test"}], 0.0) == "OK"
@@ -119,8 +131,29 @@ def test_gemini_permanent_400_moves_to_next_model(monkeypatch):
             return SimpleNamespace(text="OK")
 
     monkeypatch.setenv("GEMINI_MODELS", "gemini/blocked,gemini/working")
-    monkeypatch.setattr(genai, "Client", lambda: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(genai, "Client", lambda **kwargs: FakeGeminiClient(FakeModels()))
     monkeypatch.setattr(llm.time, "sleep", lambda seconds: None)
 
     assert llm._chat_gemini([{"role": "user", "content": "test"}], 0.0) == "OK"
     assert calls == ["gemini/blocked", "gemini/working"]
+
+
+def test_gemini_ipv4_transport_is_scoped_to_client(monkeypatch):
+    client_options = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            return SimpleNamespace(text="OK")
+
+    def fake_client(**kwargs):
+        client_options.append(kwargs.get("http_options"))
+        return FakeGeminiClient(FakeModels())
+
+    monkeypatch.setenv("GEMINI_MODELS", "gemini/test")
+    monkeypatch.setenv("GEMINI_FORCE_IPV4", "1")
+    monkeypatch.setattr(genai, "Client", fake_client)
+
+    assert llm._chat_gemini([{"role": "user", "content": "test"}], 0.0) == "OK"
+    assert len(client_options) == 1
+    assert isinstance(client_options[0].httpx_client, httpx2.Client)
+    assert client_options[0].httpx_client.is_closed

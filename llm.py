@@ -14,6 +14,7 @@ import os
 import re
 import time
 from collections import Counter
+from contextlib import ExitStack
 from datetime import datetime
 
 import requests
@@ -155,33 +156,41 @@ def _chat_gemini(messages, temperature):
     from google.genai import types
     system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
     user = "\n\n".join(m["content"] for m in messages if m.get("role") != "system")
-    client = genai.Client()
-    cfg = types.GenerateContentConfig(temperature=temperature,
-                                      max_output_tokens=_max_tokens(),
-                                      system_instruction=system or None)
-    ms = gemini_models()
-    last_err = None
-    for idx, m in enumerate(ms):
-        for attempt in range(1, MAX_MODEL_ATTEMPTS + 1):
-            try:
-                _log(f"Gemini {m} (приоритет {idx + 1}/{len(ms)}, "
-                     f"попытка {attempt}/{MAX_MODEL_ATTEMPTS})")
-                resp = client.models.generate_content(model=m, contents=user, config=cfg)
-                text = resp.text
-                if not isinstance(text, str) or not text.strip():
-                    raise RuntimeError("пустой ответ")
-                if idx > 0:
-                    _log(f"успешно на резервной Gemini {m}")
-                return text
-            except Exception as e:
-                last_err = e
-                _log(f"ошибка Gemini {m}: {type(e).__name__}: {str(e)[:150]}")
-                if _retry_model(e, m, attempt):
-                    continue
-                break
-        if idx + 1 < len(ms):
-            _log(f"переключаюсь на следующую Gemini: {ms[idx + 1]}")
-    raise RuntimeError(f"все {len(ms)} Gemini-моделей не сработали; последняя: {last_err}")
+    with ExitStack() as stack:
+        if os.environ.get("GEMINI_FORCE_IPV4") == "1":
+            import httpx2
+            transport = httpx2.HTTPTransport(local_address="0.0.0.0")
+            http_client = stack.enter_context(httpx2.Client(transport=transport))
+            client = stack.enter_context(genai.Client(
+                http_options=types.HttpOptions(httpx_client=http_client)))
+        else:
+            client = stack.enter_context(genai.Client())
+        cfg = types.GenerateContentConfig(temperature=temperature,
+                                          max_output_tokens=_max_tokens(),
+                                          system_instruction=system or None)
+        ms = gemini_models()
+        last_err = None
+        for idx, m in enumerate(ms):
+            for attempt in range(1, MAX_MODEL_ATTEMPTS + 1):
+                try:
+                    _log(f"Gemini {m} (приоритет {idx + 1}/{len(ms)}, "
+                         f"попытка {attempt}/{MAX_MODEL_ATTEMPTS})")
+                    resp = client.models.generate_content(model=m, contents=user, config=cfg)
+                    text = resp.text
+                    if not isinstance(text, str) or not text.strip():
+                        raise RuntimeError("пустой ответ")
+                    if idx > 0:
+                        _log(f"успешно на резервной Gemini {m}")
+                    return text
+                except Exception as e:
+                    last_err = e
+                    _log(f"ошибка Gemini {m}: {type(e).__name__}: {str(e)[:150]}")
+                    if _retry_model(e, m, attempt):
+                        continue
+                    break
+            if idx + 1 < len(ms):
+                _log(f"переключаюсь на следующую Gemini: {ms[idx + 1]}")
+        raise RuntimeError(f"все {len(ms)} Gemini-моделей не сработали; последняя: {last_err}")
 
 
 def _chat_openrouter(messages, temperature, timeout):

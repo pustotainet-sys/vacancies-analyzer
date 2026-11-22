@@ -254,6 +254,39 @@ def _result(n, techs):
     return {"n": n, "df": dict(techs), "source": {}, "cooccur": {}, "raw_skills": {}}
 
 
+def test_snapshot_models_survive_reopen_and_reanalysis(tmp_path):
+    db_path = tmp_path / "models.db"
+    conn = storage.connect(str(db_path))
+    storage.init_schema(conn)
+    analyzed = _result(1, {"Python": 1})
+    analyzed["models_used"] = ["Gemini API: gemini-3.6-flash", "OpenRouter: selected/model"]
+    run_id = storage.write_snapshot(
+        conn, {"query_text": "python", "area": "113", "method": "llm"}, analyzed, [])
+    conn.close()
+
+    conn = storage.connect(str(db_path))
+    storage.init_schema(conn)
+    snapshot = storage.latest_ok_snapshot(conn, "python", "113")
+    assert snapshot["models_used_json"] == ('["Gemini API: gemini-3.6-flash", '
+                                            '"OpenRouter: selected/model"]')
+    storage.replace_analysis(conn, run_id, _result(1, {"Python": 1}), "basic")
+    snapshot = storage.latest_ok_snapshot(conn, "python", "113")
+    assert snapshot["models_used_json"] == "[]"
+    conn.close()
+
+
+def test_model_column_migrates_existing_snapshot(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = storage.connect(str(db_path))
+    storage.init_schema(conn)
+    conn.execute("ALTER TABLE snapshots DROP COLUMN models_used_json")
+    conn.commit()
+    storage.init_schema(conn)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}
+    assert "models_used_json" in columns
+    conn.close()
+
+
 def _vac(vac_id, published_at, description="desc", **over):
     row = {"vac_id": vac_id, "name": f"Вакансия {vac_id}", "company": "ООО Тест",
            "published_at": published_at, "area": "Москва",

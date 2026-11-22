@@ -150,7 +150,7 @@ def _retry_model(error, model, attempt):
     return True
 
 
-def _chat_gemini(messages, temperature):
+def _chat_gemini(messages, temperature, on_model=None):
     """Прямой Gemini: до трёх попыток каждой модели, затем следующая."""
     from google import genai
     from google.genai import types
@@ -181,6 +181,8 @@ def _chat_gemini(messages, temperature):
                         raise RuntimeError("пустой ответ")
                     if idx > 0:
                         _log(f"успешно на резервной Gemini {m}")
+                    if on_model:
+                        on_model(f"Gemini API: {m}")
                     return text
                 except Exception as e:
                     last_err = e
@@ -193,7 +195,7 @@ def _chat_gemini(messages, temperature):
         raise RuntimeError(f"все {len(ms)} Gemini-моделей не сработали; последняя: {last_err}")
 
 
-def _chat_openrouter(messages, temperature, timeout):
+def _chat_openrouter(messages, temperature, timeout, on_model=None):
     key = api_key()
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY не задан")
@@ -224,6 +226,8 @@ def _chat_openrouter(messages, temperature, timeout):
                                        f"finish_reason={finish_reason}")
                 if idx > 0:
                     _log(f"успешно на резервной модели {m}")
+                if on_model:
+                    on_model(f"OpenRouter: {selected_model}")
                 return content
             except Exception as e:
                 detail = ""
@@ -239,7 +243,7 @@ def _chat_openrouter(messages, temperature, timeout):
     raise RuntimeError(f"OpenRouter: все {len(ms)} моделей не сработали; последняя: {last_err}")
 
 
-def _chat(messages, temperature=0.0, timeout=180):
+def _chat(messages, temperature=0.0, timeout=180, on_model=None):
     """Запрос к LLM с приоритетом провайдеров: прямой Gemini -> OpenRouter.
 
     Всё упало — RuntimeError (выше по стеку это приведёт к откату на базовый режим).
@@ -248,14 +252,14 @@ def _chat(messages, temperature=0.0, timeout=180):
     # 1) прямой Gemini API — высший приоритет (со своим перебором моделей)
     if gemini_key():
         try:
-            return _chat_gemini(messages, temperature)
+            return _chat_gemini(messages, temperature, on_model)
         except Exception as e:
             errors.append(f"gemini: {type(e).__name__}: {str(e)[:150]}")
             _log("все Gemini-модели не сработали — переключаюсь на OpenRouter")
     # 2) OpenRouter (цепочка моделей по приоритету)
     if api_key():
         try:
-            return _chat_openrouter(messages, temperature, timeout)
+            return _chat_openrouter(messages, temperature, timeout, on_model)
         except Exception as e:
             errors.append(str(e)[:200])
     raise RuntimeError("все провайдеры LLM не сработали: " +
@@ -316,10 +320,10 @@ _BATCH_SYS = (
 )
 
 
-def _extract_batch(vacs, max_desc):
+def _extract_batch(vacs, max_desc, on_model=None):
     prompt = "\n\n".join(_vacancy_block(i, v, max_desc) for i, v in enumerate(vacs))
     content = _chat([{"role": "system", "content": _BATCH_SYS},
-                     {"role": "user", "content": prompt}])
+                     {"role": "user", "content": prompt}], on_model=on_model)
     out = {}
     data = _parse_json(content)
     for item in data.get("vacancies", []) if isinstance(data, dict) else []:
@@ -357,14 +361,15 @@ _RANK_SYS = (
 )
 
 
-def _rank(item_counts):
+def _rank(item_counts, on_model=None):
     """item_counts: {строка: сколько вакансий содержат}. Возвращает [(канон, count)] по убыванию."""
     if not item_counts:
         return []
     payload = [{"item": k, "count": v}
                for k, v in sorted(item_counts.items(), key=lambda kv: -kv[1])]
     content = _chat([{"role": "system", "content": _RANK_SYS},
-                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
+                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                    on_model=on_model)
     data = _parse_json(content)
     ranked = data.get("ranked", []) if isinstance(data, dict) else []
     out = []
@@ -384,6 +389,7 @@ def aggregate_llm(vacancies, progress=None):
     batch = _batch_size()
     max_desc = _max_desc()
     total_batches = math.ceil(n / batch) if n else 0
+    used_models = []
 
     # этап 1: по каждой вакансии — множество требований
     seen_counts = Counter()  # сколько вакансий содержат каждую сырую формулировку
@@ -393,7 +399,7 @@ def aggregate_llm(vacancies, progress=None):
             chunk = vacancies[b * batch:(b + 1) * batch]
             if progress:
                 progress(f"LLM: разбор батча {b + 1}/{total_batches}…")
-            res = _extract_batch(chunk, max_desc)
+            res = _extract_batch(chunk, max_desc, used_models.append)
             for idx in range(len(chunk)):
                 items = res.get(idx, [])
                 seen_counts.update(set(items))  # set -> одна вакансия = один голос
@@ -414,7 +420,7 @@ def aggregate_llm(vacancies, progress=None):
     # этап 2: модель сама сливает перефразировки и сортирует по частоте
     if progress and seen_counts:
         progress("LLM: итоговое слияние и ранжирование…")
-    ranked = _rank(dict(seen_counts))
+    ranked = _rank(dict(seen_counts), used_models.append)
     if not ranked:  # модель не вернула — падать не будем, возьмём сырые частоты
         ranked = sorted(seen_counts.items(), key=lambda kv: -kv[1])
 
@@ -428,4 +434,5 @@ def aggregate_llm(vacancies, progress=None):
         "source": {t: "llm" for t in df},
         "cooccur": {},  # в LLM-режиме co-occurrence не считаем
         "raw_skills": {},
+        "models_used": list(dict.fromkeys(used_models)),
     }

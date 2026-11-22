@@ -459,6 +459,12 @@ async def cmd_status(update, context):
         method = L["method"] if "method" in L.keys() and L["method"] else "?"
         lines.append(f"Последний сбор: {L['ts_msk']}; вакансий {L['vacancy_count']} "
                      f"(деталей {L['enriched_count']}); метод: {method}")
+        if method == "llm":
+            models = json.loads(L["models_used_json"]) if L["models_used_json"] else []
+            lines.append("Модели анализа: " + (", ".join(models) if models else
+                         "не записаны для этого сбора"))
+        elif method.startswith("basic"):
+            lines.append("Модели анализа: не использовались (базовый режим)")
     else:
         lines.append("По этому запросу сборов ещё не было.")
     if tracked:

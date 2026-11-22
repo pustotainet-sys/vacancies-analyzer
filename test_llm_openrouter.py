@@ -48,6 +48,7 @@ def _response(model, content):
 
 def test_openrouter_retries_empty_content_twice_then_uses_next_model(monkeypatch, capsys):
     calls = []
+    used_models = []
     responses = iter([_response("routed/reasoning", None) for _ in range(3)]
                      + [_response("fallback/model", '{"vacancies":[]}')])
 
@@ -60,10 +61,12 @@ def test_openrouter_retries_empty_content_twice_then_uses_next_model(monkeypatch
     monkeypatch.setattr(llm.requests, "post", fake_post)
     monkeypatch.setattr(llm.time, "sleep", lambda seconds: None)
 
-    answer = llm._chat_openrouter([{"role": "user", "content": "test"}], 0.0, 10)
+    answer = llm._chat_openrouter([{"role": "user", "content": "test"}], 0.0, 10,
+                                  used_models.append)
 
     assert answer == '{"vacancies":[]}'
     assert calls == ["openrouter/auto"] * 3 + ["fallback/model"]
+    assert used_models == ["OpenRouter: fallback/model"]
     assert "OpenRouter выбрал routed/reasoning; finish_reason=stop" in capsys.readouterr().out
 
 

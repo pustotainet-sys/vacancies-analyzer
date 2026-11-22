@@ -5,6 +5,7 @@
 сырые вакансии пруним по retention.
 """
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     query_text TEXT NOT NULL, area TEXT NOT NULL,
     per_page INTEGER, max_items INTEGER,
     total_found INTEGER, vacancy_count INTEGER, enriched_count INTEGER DEFAULT 0,
-    method TEXT, status TEXT NOT NULL, error TEXT, duration_sec REAL);
+    method TEXT, models_used_json TEXT, status TEXT NOT NULL, error TEXT, duration_sec REAL);
 CREATE INDEX IF NOT EXISTS ix_snap_query ON snapshots(query_text, area, ts_utc);
 
 CREATE TABLE IF NOT EXISTS tech_counts (
@@ -115,6 +116,8 @@ def init_schema(conn):
             conn.execute("ALTER TABLE snapshots ADD COLUMN method TEXT")
         except sqlite3.OperationalError:
             pass  # колонка уже есть
+        if "models_used_json" not in {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN models_used_json TEXT")
         conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
         conn.commit()
@@ -187,11 +190,13 @@ def write_snapshot(conn, meta, result, raw_rows):
     with _LOCK:
         cur = conn.execute(
             """INSERT INTO snapshots(ts_utc, ts_msk, query_text, area, per_page, max_items,
-                   total_found, vacancy_count, enriched_count, method, status, duration_sec)
-               VALUES(?,?,?,?,?,?,?,?,?,?, 'ok', ?)""",
+                   total_found, vacancy_count, enriched_count, method, models_used_json,
+                   status, duration_sec)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?, 'ok', ?)""",
             (ts_utc, ts_msk, meta["query_text"], str(meta["area"]),
              meta.get("per_page"), meta.get("max_items"), meta.get("total_found"),
              n, meta.get("enriched_count", 0), meta.get("method"),
+             json.dumps(result.get("models_used", []), ensure_ascii=False),
              meta.get("duration_sec")))
         run_id = cur.lastrowid
 
@@ -402,7 +407,8 @@ def replace_analysis(conn, run_id, result, method):
         conn.executemany(
             "INSERT INTO cooccurrence(run_id, tech_a, tech_b, cnt) VALUES(?,?,?,?)",
             [(run_id, a, b, c) for (a, b), c in result["cooccur"].items()])
-        conn.execute("UPDATE snapshots SET method=? WHERE run_id=?", (method, run_id))
+        conn.execute("UPDATE snapshots SET method=?, models_used_json=? WHERE run_id=?",
+                     (method, json.dumps(result.get("models_used", []), ensure_ascii=False), run_id))
         conn.commit()
 
 

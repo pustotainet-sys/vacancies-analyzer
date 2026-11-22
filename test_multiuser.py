@@ -162,6 +162,24 @@ def test_has_active_only_while_queued_or_running(conn):
 
 
 # --- квоты -------------------------------------------------------------------
+def test_admin_and_regular_user_have_different_daily_limits(conn, monkeypatch):
+    # Arrange
+    import bot
+    monkeypatch.setattr(bot, "ADMINS", {"1"})
+    storage.register_user(conn, 1)
+    storage.register_user(conn, 2)
+    # Act
+    admin_verdicts = [storage.try_spend_llm_quota(
+        conn, 1, bot._llm_quota_for(1), 100) for _ in range(51)]
+    user_verdicts = [storage.try_spend_llm_quota(
+        conn, 2, bot._llm_quota_for(2), 100) for _ in range(6)]
+    # Assert
+    assert admin_verdicts == ["ok"] * 50 + ["user_exceeded"], admin_verdicts
+    assert user_verdicts == ["ok"] * 5 + ["user_exceeded"], user_verdicts
+    assert storage.llm_quota_left(conn, 1, bot._llm_quota_for(1), 100) == (0, 45), (
+        "остаток квоты администратора или общий счётчик неверен")
+
+
 def test_user_quota_blocks_after_limit(conn):
     storage.register_user(conn, 1)
     assert [storage.try_spend_llm_quota(conn, 1, 2, 100) for _ in range(3)] == [

@@ -56,6 +56,7 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(HERE, "hh_stats.db"))
 WORKERS = int(os.environ.get("WORKERS", "2"))
 QUEUE_POLL_SEC = 2.0
 LLM_QUOTA_USER = int(os.environ.get("LLM_DAILY_QUOTA_USER", "5"))
+LLM_QUOTA_ADMIN = int(os.environ.get("LLM_DAILY_QUOTA_ADMIN", "50"))
 LLM_QUOTA_GLOBAL = int(os.environ.get("LLM_DAILY_QUOTA_GLOBAL", "100"))
 TRACK_LIMIT_USER = int(os.environ.get("TRACK_LIMIT_USER", "5"))
 TRACKED_MAX_TOTAL = int(os.environ.get("TRACKED_MAX_TOTAL", "40"))
@@ -98,6 +99,10 @@ ADMINS = _id_set("TELEGRAM_ADMIN_CHATS")
 
 def _is_admin(chat_id):
     return str(chat_id) in ADMINS
+
+
+def _llm_quota_for(chat_id):
+    return LLM_QUOTA_ADMIN if _is_admin(chat_id) else LLM_QUOTA_USER
 
 
 async def _admin_only(update, context):
@@ -561,7 +566,8 @@ async def cmd_status(update, context):
     L = storage.latest_ok_snapshot(conn, st["query_text"], st["area"])
     last = storage.last_snapshot(conn, st["query_text"], st["area"])
     queued, running = jobs.queue_depth(conn)
-    left_user, left_global = storage.llm_quota_left(conn, cid, LLM_QUOTA_USER, LLM_QUOTA_GLOBAL)
+    user_limit = _llm_quota_for(cid)
+    left_user, left_global = storage.llm_quota_left(conn, cid, user_limit, LLM_QUOTA_GLOBAL)
     tracked = jobs.user_tracked(conn, cid)
     selected_query = (f"{st['query_text']} / {_area_label(st['area'])}"
                       if st["query_text"] else "не выбран")
@@ -598,7 +604,7 @@ async def cmd_status(update, context):
     else:
         lines.append("Отслеживаемых запросов нет — /track добавит текущий.")
     lines.append(f"Очередь: {queued} ждут, {running} в работе.")
-    lines.append(f"Лимит LLM на сегодня: осталось {left_user} из {LLM_QUOTA_USER}.")
+    lines.append(f"Лимит LLM на сегодня: осталось {left_user} из {user_limit}.")
     if last and last["status"] == "error":
         lines.append(f"⚠️ Последний сбор с ошибкой: {last['error']}")
     if left_global == 0:
@@ -639,11 +645,12 @@ async def _submit(context, chat_id, kind, query_text, area, mode=None, announce=
     effective = (mode or os.environ.get("LLM_MODE", "auto")).lower()
     wants_llm = effective in ("llm", "auto") and llm.available()
     if wants_llm and not jobs.has_active(conn, kind, query_text, area, mode):
-        verdict = storage.try_spend_llm_quota(conn, chat_id, LLM_QUOTA_USER, LLM_QUOTA_GLOBAL)
+        user_limit = _llm_quota_for(chat_id)
+        verdict = storage.try_spend_llm_quota(conn, chat_id, user_limit, LLM_QUOTA_GLOBAL)
         if verdict == "user_exceeded":
             await context.bot.send_message(
                 chat_id, f"Дневной лимит анализов через LLM исчерпан "
-                         f"({LLM_QUOTA_USER}/сутки). Данные, собранные ранее, доступны "
+                         f"({user_limit}/сутки). Данные, собранные ранее, доступны "
                          f"по кнопкам — новый анализ будет доступен завтра.")
             return False
         if verdict == "global_exceeded":
@@ -1280,7 +1287,7 @@ async def _do_stats(context, cid):
     queued, running = jobs.queue_depth(conn)
     done, failed = jobs.stats_24h(conn)
     avg = jobs.avg_duration(conn)
-    _, left_global = storage.llm_quota_left(conn, cid, LLM_QUOTA_USER, LLM_QUOTA_GLOBAL)
+    _, left_global = storage.llm_quota_left(conn, cid, _llm_quota_for(cid), LLM_QUOTA_GLOBAL)
     db_mb = os.path.getsize(DB_PATH) / 2**20 if os.path.exists(DB_PATH) else 0
     lines = [
         f"Пользователи: {total} (активных за 7 дней: {active})",

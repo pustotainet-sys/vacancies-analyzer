@@ -266,6 +266,20 @@ def test_saved_filters_are_buttons_with_selected_pair(conn):
         f"активная пара не отмечена: {saved[1].text}")
     assert saved[1].callback_data.endswith(bot._saved_filter_token("golang", "1")), (
         f"неверная привязка кнопки: {saved[1].callback_data}")
+    query_buttons = keyboard.inline_keyboard[3]
+    assert query_buttons[0].text == "python", query_buttons
+    assert query_buttons[1].text == "• ✏️ golang", query_buttons
+
+
+def test_default_query_is_marked_in_filter_row():
+    # Arrange
+    import bot
+    state = {"query_text": "python", "area": "113", "period_days": 30, "top_n": 15}
+    # Act
+    query_buttons = bot.filter_kb(state).inline_keyboard[3]
+    # Assert
+    assert query_buttons[0].text == "• python", query_buttons
+    assert query_buttons[1].text == "✏️ свой запрос", query_buttons
 
 
 def test_saved_filter_remains_after_untrack(conn):

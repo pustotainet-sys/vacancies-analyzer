@@ -371,7 +371,8 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
          InlineKeyboardButton(_mark(n, 15, "топ-15"), callback_data="topn:15"),
          InlineKeyboardButton(_mark(n, 30, "топ-30"), callback_data="topn:30")],
         [InlineKeyboardButton(_mark(q, "python", "python"), callback_data="text:python"),
-         InlineKeyboardButton("✏️ свой запрос", callback_data="text:custom")],
+         InlineKeyboardButton(f"• ✏️ {q[:24]}" if q != "python" else "✏️ свой запрос",
+                              callback_data="text:custom")],
     ]
     for index, (query, area) in enumerate(saved_filters):
         pin = "📌 " if (query, str(area)) in tracked_filters else ""

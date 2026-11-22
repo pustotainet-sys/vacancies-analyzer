@@ -43,12 +43,11 @@ CREATE TABLE IF NOT EXISTS vacancy_details (
     alternate_url TEXT, key_skills_json TEXT, description TEXT,
     snippet_req TEXT, snippet_resp TEXT, fetched_at TEXT);
 
--- published_at продублирован в связке намеренно: hh меняет его при перепубликации,
--- а снимок должен сохранять порядок «свежие сверху» таким, каким он был на момент
--- сбора. Поле короткое — на экономии от выноса описаний это не сказывается.
+-- published_at продублирован в связке: hh меняет его при перепубликации.
+-- search_rank сохраняет порядок релевантности из ответа hh для конкретного снимка.
 CREATE TABLE IF NOT EXISTS snapshot_items (
     run_id INTEGER NOT NULL REFERENCES snapshots(run_id) ON DELETE CASCADE,
-    vac_id TEXT NOT NULL, published_at TEXT,
+    vac_id TEXT NOT NULL, published_at TEXT, search_rank INTEGER,
     PRIMARY KEY (run_id, vac_id));
 CREATE INDEX IF NOT EXISTS ix_items_vac ON snapshot_items(vac_id);
 
@@ -123,6 +122,8 @@ def init_schema(conn):
             pass  # колонка уже есть
         if "models_used_json" not in {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}:
             conn.execute("ALTER TABLE snapshots ADD COLUMN models_used_json TEXT")
+        if "search_rank" not in {row["name"] for row in conn.execute("PRAGMA table_info(snapshot_items)")}:
+            conn.execute("ALTER TABLE snapshot_items ADD COLUMN search_rank INTEGER")
         seeded = conn.execute("SELECT 1 FROM meta WHERE key='saved_filters_seeded'").fetchone()
         if not seeded:
             conn.execute("INSERT OR IGNORE INTO saved_filters(chat_id, query_text, area, created_at) "
@@ -259,8 +260,10 @@ def write_snapshot(conn, meta, result, raw_rows):
               r.get("description"), r.get("snippet_req"), r.get("snippet_resp"), ts_utc)
              for r in raw_rows])
         conn.executemany(
-            "INSERT OR IGNORE INTO snapshot_items(run_id, vac_id, published_at) VALUES(?,?,?)",
-            [(run_id, r["vac_id"], r.get("published_at")) for r in raw_rows])
+            "INSERT OR IGNORE INTO snapshot_items(run_id, vac_id, published_at, search_rank) "
+            "VALUES(?,?,?,?)",
+            [(run_id, r["vac_id"], r.get("published_at"), rank)
+             for rank, r in enumerate(raw_rows)])
         conn.commit()
     return run_id
 
@@ -422,12 +425,13 @@ def tech_counts(conn, run_id):
 
 
 def snapshot_vacancies(conn, run_id, limit):
-    """Вакансии снимка, свежие сверху."""
+    """Вакансии снимка в порядке релевантности hh (старые снимки — по дате)."""
     with _LOCK:
         rows = conn.execute(
             """SELECT d.vac_id, d.name, d.company, i.published_at, d.alternate_url
                FROM snapshot_items i JOIN vacancy_details d USING (vac_id)
-               WHERE i.run_id=? ORDER BY i.published_at DESC, d.vac_id DESC LIMIT ?""",
+               WHERE i.run_id=? ORDER BY i.search_rank IS NULL, i.search_rank,
+                   i.published_at DESC, d.vac_id DESC LIMIT ?""",
             (run_id, limit)).fetchall()
     return [dict(r) for r in rows]
 

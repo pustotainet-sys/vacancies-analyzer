@@ -136,12 +136,12 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
     try:
         with _hh_sem:  # сеть к hh — строго последовательно: общий токен приложения и один IP
             session = build_session()
-            # search_field пуст -> hh ищет по всем полям (как на сайте); можно сузить
-            # через HH_SEARCH_FIELD=name (только по названию).
-            search_field = os.environ.get("HH_SEARCH_FIELD") or None
+            # Поиск по всем полям ловит совпадения в названии компании и описании:
+            # например, врачей из «Аналитик-Центр» по запросу «системная аналитика».
+            search_field = os.environ.get("HH_SEARCH_FIELD", "name") or None
             items, total_found = fetch_vacancies(
                 session, query, area, per_page=100, max_items=analyze_top_n,
-                extra_params={"order_by": "publication_time"}, search_field=search_field)
+                extra_params={"order_by": "relevance"}, search_field=search_field)
 
             total = len(items)
             # детали уже виденных вакансий берём из БД — по сети тянем только новые

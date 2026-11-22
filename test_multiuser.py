@@ -537,6 +537,29 @@ def test_hh_search_region_parameters(monkeypatch, area, expected_area):
         f"для {area} ожидался area={expected_area}, получено {actual_area}")
 
 
+def test_collector_searches_titles_by_relevance(conn, monkeypatch):
+    # Arrange
+    import collector
+    seen = {}
+    monkeypatch.delenv("HH_SEARCH_FIELD", raising=False)
+    monkeypatch.setattr(collector, "build_session", lambda: None)
+
+    def fake_fetch(session, text, area, per_page, max_items, extra_params, search_field):
+        seen.update({"text": text, "order": extra_params["order_by"],
+                     "field": search_field})
+        return [], 0
+
+    monkeypatch.setattr(collector, "fetch_vacancies", fake_fetch)
+    monkeypatch.setattr(collector, "_analyze", lambda conn, items, mode, progress: (
+        _result(0, {}), "basic"))
+    # Act
+    outcome = collector.collect_once(conn, "системная аналитика", "113", 100)
+    # Assert
+    assert outcome["status"] == "ok", outcome
+    assert seen == {"text": "системная аналитика", "order": "relevance",
+                    "field": "name"}, seen
+
+
 def test_rename_filter_keeps_tracking_and_changes_selected_pair(conn):
     # Arrange
     import bot
@@ -815,13 +838,25 @@ def test_empty_description_does_not_erase_stored_one(conn):
 
 
 def test_snapshot_keeps_its_own_published_at(conn):
-    """Перепубликация вакансии не должна переписывать порядок старого снимка."""
+    """Перепубликация вакансии не должна менять порядок старого снимка."""
     run1 = _snapshot(conn, "python", [_vac("1", "2026-01-01T00:00:00+0300"),
                                       _vac("2", "2026-01-02T00:00:00+0300")])
     _snapshot(conn, "python", [_vac("1", "2026-06-01T00:00:00+0300"),
                                _vac("2", "2026-01-02T00:00:00+0300")])
     first = storage.snapshot_vacancies(conn, run1, 10)
-    assert [r["vac_id"] for r in first] == ["2", "1"]
+    assert [r["vac_id"] for r in first] == ["1", "2"]
+
+
+def test_snapshot_preserves_hh_search_order(conn):
+    # Arrange
+    rows = [_vac("older-relevant", "2026-01-01T00:00:00+0300"),
+            _vac("newer-less-relevant", "2026-01-02T00:00:00+0300")]
+    # Act
+    run_id = _snapshot(conn, "аналитик", rows)
+    listed = storage.snapshot_vacancies(conn, run_id, 10)
+    # Assert
+    assert [row["vac_id"] for row in listed] == [
+        "older-relevant", "newer-less-relevant"], "нарушен порядок релевантности hh"
 
 
 def test_stored_details_skips_missing_description(conn):

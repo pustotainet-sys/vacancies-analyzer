@@ -124,8 +124,8 @@ def fetch_vacancies(session, text, area, per_page, max_items, extra_params=None,
     }
     if area not in (None, "", "all"):
         params["area"] = area
-    # по умолчанию hh ищет по всем полям (как на сайте); name/company/description —
-    # чтобы сузить. Раньше было жёстко "name" — это резко занижало число вакансий.
+    # Без search_field hh ищет по всем полям. Бот по умолчанию задаёт name,
+    # чтобы не собирать вакансии по совпадению в названии компании или описании.
     if search_field:
         params["search_field"] = search_field
     if extra_params:

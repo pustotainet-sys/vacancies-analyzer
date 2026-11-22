@@ -325,6 +325,37 @@ def test_select_python_uses_existing_saved_pair(conn):
         "выбор python создал лишний фильтр")
 
 
+def test_delete_selects_saved_python_with_its_region(conn):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.save_filter(conn, 1, "python", "all")
+    storage.save_filter(conn, 1, "агент", "113")
+    storage.set_chat_state(conn, 1, query_text="агент", area="113")
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    storage.delete_filter(conn, 1, "агент", "113")
+    bot._select_remaining_filter(context, 1)
+    state = storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    # Assert
+    assert (state["query_text"], state["area"]) == ("python", "all"), state
+
+
+def test_delete_uses_default_only_when_no_saved_filters_remain(conn):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.save_filter(conn, 1, "агент", "all")
+    storage.set_chat_state(conn, 1, query_text="агент", area="all")
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    storage.delete_filter(conn, 1, "агент", "all")
+    bot._select_remaining_filter(context, 1)
+    state = storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    # Assert
+    assert (state["query_text"], state["area"]) == (bot.DEFAULT_QUERY, bot.DEFAULT_AREA), state
+
+
 def test_python_filter_can_move_to_world(conn, monkeypatch):
     # Arrange
     import bot

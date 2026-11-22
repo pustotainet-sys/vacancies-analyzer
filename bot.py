@@ -454,6 +454,17 @@ def _select_python_filter(context, chat_id):
         storage.save_filter(conn, chat_id, "python", selected_area)
 
 
+def _select_remaining_filter(context, chat_id):
+    conn = _conn(context)
+    saved = storage.user_saved_filters(conn, chat_id)
+    if saved:
+        query, area = next(((query, area) for query, area in saved if query == "python"),
+                           saved[0])
+    else:
+        query, area = DEFAULT_QUERY, DEFAULT_AREA
+    storage.set_chat_state(conn, chat_id, query_text=query, area=area)
+
+
 MENU_TEXT = ("Анализ требований вакансий hh.ru.\n"
              "Выберите действие:")
 FILTER_TEXT = "Фильтры анализа (• — выбрано):"
@@ -948,7 +959,7 @@ async def on_callback(update, context):
         query, area = st["query_text"], str(st["area"])
         jobs.untrack(conn, query, area, cid)
         storage.delete_filter(conn, cid, query, area)
-        storage.set_chat_state(conn, cid, query_text=DEFAULT_QUERY, area=DEFAULT_AREA)
+        _select_remaining_filter(context, cid)
         st = _state(context, cid)
         await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
     elif data == "edit_area":

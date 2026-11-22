@@ -269,6 +269,10 @@ def test_saved_filters_are_buttons_with_selected_pair(conn):
     query_buttons = keyboard.inline_keyboard[3]
     assert query_buttons[0].text == "python", query_buttons
     assert query_buttons[1].text == "• ✏️ golang", query_buttons
+    assert query_buttons[1].callback_data == "edit_filter", query_buttons
+    assert any(button.callback_data == "text:custom"
+               for row in keyboard.inline_keyboard for button in row), (
+        "после выбора существующего фильтра пропала возможность создать новый")
 
 
 def test_default_query_is_marked_in_filter_row():
@@ -280,6 +284,38 @@ def test_default_query_is_marked_in_filter_row():
     # Assert
     assert query_buttons[0].text == "• python", query_buttons
     assert query_buttons[1].text == "✏️ свой запрос", query_buttons
+
+
+def test_rename_filter_keeps_tracking_and_changes_selected_pair(conn):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.set_chat_state(conn, 1, query_text="ai ии", area="113")
+    storage.save_filter(conn, 1, "ai ии", "113")
+    jobs.track(conn, "ai ии", "113", 1)
+    # Act
+    status = storage.rename_filter(conn, 1, "ai ии", "113", "ai ml", "1")
+    # Assert
+    assert status == "renamed", f"фильтр не исправлен: {status}"
+    assert storage.user_saved_filters(conn, 1) == [("ai ml", "1")], (
+        "список сохранённых фильтров не обновился")
+    assert jobs.user_tracked(conn, 1) == [("ai ml", "1")], (
+        "отслеживание не перенесено")
+    state = storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    assert (state["query_text"], state["area"]) == ("ai ml", "1"), state
+
+
+def test_rename_filter_rejects_existing_target_without_changes(conn):
+    # Arrange
+    storage.save_filter(conn, 1, "ai ии", "113")
+    storage.save_filter(conn, 1, "python", "113")
+    jobs.track(conn, "ai ии", "113", 1)
+    # Act
+    status = storage.rename_filter(conn, 1, "ai ии", "113", "python", "113")
+    # Assert
+    assert status == "exists", f"дубликат был принят: {status}"
+    assert jobs.user_tracked(conn, 1) == [("ai ии", "113")], (
+        "отслеживание изменилось при отказе")
 
 
 def test_saved_filter_remains_after_untrack(conn):

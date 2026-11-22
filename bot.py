@@ -70,6 +70,7 @@ STATE_DEFAULTS = {"query_text": DEFAULT_QUERY, "area": DEFAULT_AREA,
                   "period_days": PERIOD_DEFAULT, "top_n": TOP_N_DEFAULT}
 AWAIT_TEXT = 1    # состояние ConversationHandler: свой запрос
 AWAIT_INVITE = 2  # состояние ConversationHandler: инвайт-код при регистрации
+AWAIT_EDIT = 3    # исправление сохранённого фильтра
 
 
 # --- токен / доступ ----------------------------------------------------------
@@ -372,8 +373,11 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
          InlineKeyboardButton(_mark(n, 30, "топ-30"), callback_data="topn:30")],
         [InlineKeyboardButton(_mark(q, "python", "python"), callback_data="text:python"),
          InlineKeyboardButton(f"• ✏️ {q[:24]}" if q != "python" else "✏️ свой запрос",
-                              callback_data="text:custom")],
+                              callback_data="edit_filter" if q != "python"
+                              else "text:custom")],
     ]
+    if q != "python":
+        rows.append([InlineKeyboardButton("➕ Новый запрос", callback_data="text:custom")])
     for index, (query, area) in enumerate(saved_filters):
         pin = "📌 " if (query, str(area)) in tracked_filters else ""
         label = f"{pin}{query} / {_area_label(area)}"
@@ -381,6 +385,9 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
             label = "• " + label
         rows.append([InlineKeyboardButton(
             label[:60], callback_data=f"saved:{index}:{_saved_filter_token(query, area)}")])
+    if (q, str(a)) in saved_filters:
+        rows.append([InlineKeyboardButton("🌍 Исправить регион фильтра",
+                                          callback_data="edit_area")])
     rows.extend([[InlineKeyboardButton(track_label, callback_data="track")],
                  [InlineKeyboardButton("🗑 Удалить текущий фильтр", callback_data="delete_filter")],
                  [InlineKeyboardButton("⬅️ Назад", callback_data="home")]])
@@ -393,6 +400,33 @@ def _filter_kb(context, chat_id, state):
     tracked = jobs.user_tracked(conn, chat_id)
     active = (state["query_text"], str(state["area"])) in tracked
     return filter_kb(state, active, saved, tracked)
+
+
+def _edit_area_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Россия", callback_data="move:113"),
+         InlineKeyboardButton("Москва", callback_data="move:1"),
+         InlineKeyboardButton("СПб", callback_data="move:2")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="flt")],
+    ])
+
+
+def _rename_saved_filter(context, chat_id, old_query, old_area, new_query, new_area):
+    conn = _conn(context)
+    was_tracked = (old_query, str(old_area)) in jobs.user_tracked(conn, chat_id)
+    if was_tracked and not jobs.is_tracked(conn, new_query, new_area):
+        old_subscribers = jobs.subscribers(conn, old_query, old_area)
+        source_remains = (len(old_subscribers) > 1 or
+                          (old_query == DEFAULT_QUERY and str(old_area) == str(DEFAULT_AREA)))
+        if source_remains and jobs.tracked_count(conn) >= TRACKED_MAX_TOTAL:
+            return "limit"
+    status = storage.rename_filter(conn, chat_id, old_query, old_area, new_query, new_area)
+    if status == "renamed" and was_tracked:
+        latest = storage.latest_ok_snapshot(conn, new_query, new_area)
+        if not latest or _snapshot_age(latest) >= COLLECT_INTERVAL:
+            jobs.enqueue(conn, "collect", new_query, new_area, ANALYZE_TOP_N, None, None)
+            _wake_workers(context)
+    return status
 
 
 MENU_TEXT = ("Анализ требований вакансий hh.ru.\n"
@@ -892,6 +926,29 @@ async def on_callback(update, context):
         storage.set_chat_state(conn, cid, query_text=DEFAULT_QUERY, area=DEFAULT_AREA)
         st = _state(context, cid)
         await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
+    elif data == "edit_area":
+        st = _state(context, cid)
+        pair = (st["query_text"], str(st["area"]))
+        if pair not in storage.user_saved_filters(_conn(context), cid):
+            await q.edit_message_text(FILTER_TEXT,
+                                      reply_markup=_filter_kb(context, cid, st))
+            return
+        await q.edit_message_text(f"Новый регион для «{st['query_text']}»: ",
+                                  reply_markup=_edit_area_kb())
+    elif data.startswith("move:"):
+        st = _state(context, cid)
+        new_area = data.partition(":")[2]
+        if new_area not in AREA_NAMES:
+            return
+        status = _rename_saved_filter(context, cid, st["query_text"], st["area"],
+                                      st["query_text"], new_area)
+        if status in ("exists", "limit", "missing"):
+            messages = {"exists": "Такой фильтр уже сохранён.",
+                        "limit": "Достигнут общий лимит отслеживаемых фильтров.",
+                        "missing": "Фильтр уже удалён."}
+            await context.bot.send_message(cid, messages[status])
+        st = _state(context, cid)
+        await q.edit_message_text(FILTER_TEXT, reply_markup=_filter_kb(context, cid, st))
     elif ":" in data:
         key, _, val = data.partition(":")
         field = {"area": "area", "period": "period_days", "topn": "top_n",
@@ -918,6 +975,21 @@ async def ask_custom(update, context):
     return AWAIT_TEXT
 
 
+async def ask_edit_filter(update, context):
+    q = update.callback_query
+    await q.answer()
+    cid = q.message.chat.id
+    st = _state(context, cid)
+    pair = (st["query_text"], str(st["area"]))
+    if pair not in storage.user_saved_filters(_conn(context), cid):
+        await q.message.reply_text("Выбранный фильтр не сохранён. Создайте новый запрос.")
+        return ConversationHandler.END
+    context.user_data["editing_filter"] = pair
+    await q.message.reply_text(f"Отправьте исправленный запрос вместо «{pair[0]}». "
+                               "Регион сохранится. /cancel — отмена.")
+    return AWAIT_EDIT
+
+
 async def save_custom(update, context):
     cid = update.effective_chat.id
     text = norm_query(update.message.text)
@@ -933,7 +1005,39 @@ async def save_custom(update, context):
     return ConversationHandler.END
 
 
+async def save_edit_filter(update, context):
+    cid = update.effective_chat.id
+    pair = context.user_data.get("editing_filter")
+    if pair is None:
+        await update.message.reply_text("Редактирование отменено. Откройте фильтры заново.")
+        return ConversationHandler.END
+    text = norm_query(update.message.text)
+    if not text:
+        await update.message.reply_text("Пустой запрос. Отправьте исправленный текст или /cancel.")
+        return AWAIT_EDIT
+    old_query, area = pair
+    status = _rename_saved_filter(context, cid, old_query, area, text, area)
+    if status == "exists":
+        await update.message.reply_text("Такой фильтр уже есть. Пришлите другой запрос или /cancel.")
+        return AWAIT_EDIT
+    if status == "limit":
+        await update.message.reply_text("Достигнут общий лимит отслеживаемых фильтров.")
+        return AWAIT_EDIT
+    context.user_data.pop("editing_filter", None)
+    if status == "missing":
+        await update.message.reply_text("Фильтр уже удалён. Откройте список заново.",
+                                        reply_markup=main_kb())
+    else:
+        await update.message.reply_text(
+            f"Фильтр исправлен: «{text}» / {_area_label(area)}. "
+            "Если отслеживание было включено, оно перенесено на новый запрос. "
+            "История прежнего запроса осталась отдельно.",
+            reply_markup=main_kb())
+    return ConversationHandler.END
+
+
 async def cancel_custom(update, context):
+    context.user_data.pop("editing_filter", None)
     await update.message.reply_text("Отменено.", reply_markup=main_kb())
     return ConversationHandler.END
 
@@ -1410,8 +1514,10 @@ def main():
         per_message=False,
     )
     custom_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(ask_custom, pattern=r"^text:custom$")],
-        states={AWAIT_TEXT: [MessageHandler(dialog_text, save_custom)]},
+        entry_points=[CallbackQueryHandler(ask_custom, pattern=r"^text:custom$"),
+                      CallbackQueryHandler(ask_edit_filter, pattern=r"^edit_filter$")],
+        states={AWAIT_TEXT: [MessageHandler(dialog_text, save_custom)],
+                AWAIT_EDIT: [MessageHandler(dialog_text, save_edit_filter)]},
         fallbacks=[CommandHandler("cancel", cancel_custom), button_fallback],
         per_message=False,
     )

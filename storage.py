@@ -515,6 +515,39 @@ def delete_filter(conn, chat_id, query_text, area):
         conn.commit()
 
 
+def rename_filter(conn, chat_id, old_query, old_area, new_query, new_area):
+    """Исправить сохранённую пару и перенести её подписку, если она включена."""
+    old_area, new_area = str(old_area), str(new_area)
+    with _LOCK:
+        source = conn.execute(
+            "SELECT 1 FROM saved_filters WHERE chat_id=? AND query_text=? AND area=?",
+            (chat_id, old_query, old_area)).fetchone()
+        if not source:
+            return "missing"
+        if (old_query, old_area) == (new_query, new_area):
+            return "unchanged"
+        target = conn.execute(
+            "SELECT 1 FROM saved_filters WHERE chat_id=? AND query_text=? AND area=?",
+            (chat_id, new_query, new_area)).fetchone()
+        if target:
+            return "exists"
+        conn.execute("UPDATE saved_filters SET query_text=?, area=? "
+                     "WHERE chat_id=? AND query_text=? AND area=?",
+                     (new_query, new_area, chat_id, old_query, old_area))
+        conn.execute(
+            "INSERT OR IGNORE INTO tracked_queries(query_text, area, chat_id, created_at) "
+            "SELECT ?, ?, chat_id, created_at FROM tracked_queries "
+            "WHERE chat_id=? AND query_text=? AND area=?",
+            (new_query, new_area, chat_id, old_query, old_area))
+        conn.execute("DELETE FROM tracked_queries WHERE chat_id=? AND query_text=? AND area=?",
+                     (chat_id, old_query, old_area))
+        conn.execute("UPDATE chat_state SET query_text=?, area=? "
+                     "WHERE chat_id=? AND query_text=? AND area=?",
+                     (new_query, new_area, chat_id, old_query, old_area))
+        conn.commit()
+    return "renamed"
+
+
 # --- пользователи и инвайты --------------------------------------------------
 def get_user(conn, chat_id):
     with _LOCK:

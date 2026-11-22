@@ -120,9 +120,10 @@ def fetch_vacancies(session, text, area, per_page, max_items, extra_params=None,
                     search_field=None):
     params = {
         "text": text,
-        "area": area,
         "per_page": min(per_page, MAX_PER_PAGE),
     }
+    if area not in (None, "", "all"):
+        params["area"] = area
     # по умолчанию hh ищет по всем полям (как на сайте); name/company/description —
     # чтобы сузить. Раньше было жёстко "name" — это резко занижало число вакансий.
     if search_field:
@@ -188,7 +189,7 @@ def save_csv(rows, path):
 def parse_args():
     p = argparse.ArgumentParser(description="Сбор вакансий с hh.ru")
     p.add_argument("--text", default="python", help="поисковый запрос (по умолчанию: python)")
-    p.add_argument("--area", default="113", help="регион: 113=Россия, 1=Москва, 2=СПб (по умолчанию: 113)")
+    p.add_argument("--area", default="113", help="регион: all=без ограничения, 113=Россия (по умолчанию: 113)")
     p.add_argument("--per-page", type=int, default=100, help="вакансий на страницу, макс 100")
     p.add_argument("--max-items", type=int, default=500, help="сколько всего вакансий собрать (0 = все доступные)")
     p.add_argument("--out-dir", default=".", help="каталог для выходных файлов")

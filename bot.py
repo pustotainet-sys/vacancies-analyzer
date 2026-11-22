@@ -65,7 +65,7 @@ TRACK_INTERVAL = COLLECT_INTERVAL
 TRACK_SWEEP_SECONDS = 900
 QUERY_MAX_LEN = 64
 
-AREA_NAMES = {"113": "Россия", "1": "Москва", "2": "СПб"}
+AREA_NAMES = {"all": "Весь мир", "113": "Россия", "1": "Москва", "2": "СПб"}
 STATE_DEFAULTS = {"query_text": DEFAULT_QUERY, "area": DEFAULT_AREA,
                   "period_days": PERIOD_DEFAULT, "top_n": TOP_N_DEFAULT}
 AWAIT_TEXT = 1    # состояние ConversationHandler: свой запрос
@@ -362,9 +362,8 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
     a, p, n, q = state["area"], state["period_days"], state["top_n"], state["query_text"]
     track_label = "📌 Отслеживается — снять" if tracked else "📌 Отслеживать этот запрос"
     rows = [
-        [InlineKeyboardButton(_mark(a, "113", "Россия"), callback_data="area:113"),
-         InlineKeyboardButton(_mark(a, "1", "Москва"), callback_data="area:1"),
-         InlineKeyboardButton(_mark(a, "2", "СПб"), callback_data="area:2")],
+        [InlineKeyboardButton(_mark(a, "all", "Весь мир"), callback_data="area:all"),
+         InlineKeyboardButton(_mark(a, "113", "Россия"), callback_data="area:113")],
         [InlineKeyboardButton(_mark(p, 30, "30д"), callback_data="period:30"),
          InlineKeyboardButton(_mark(p, 60, "60д"), callback_data="period:60"),
          InlineKeyboardButton(_mark(p, 90, "90д"), callback_data="period:90")],
@@ -404,9 +403,8 @@ def _filter_kb(context, chat_id, state):
 
 def _edit_area_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Россия", callback_data="move:113"),
-         InlineKeyboardButton("Москва", callback_data="move:1"),
-         InlineKeyboardButton("СПб", callback_data="move:2")],
+        [InlineKeyboardButton("Весь мир", callback_data="move:all"),
+         InlineKeyboardButton("Россия", callback_data="move:113")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="flt")],
     ])
 
@@ -938,7 +936,7 @@ async def on_callback(update, context):
     elif data.startswith("move:"):
         st = _state(context, cid)
         new_area = data.partition(":")[2]
-        if new_area not in AREA_NAMES:
+        if new_area not in ("all", "113"):
             return
         status = _rename_saved_filter(context, cid, st["query_text"], st["area"],
                                       st["query_text"], new_area)
@@ -959,6 +957,9 @@ async def on_callback(update, context):
         elif field in ("period_days", "top_n"):
             storage.set_chat_state(_conn(context), cid, **{field: int(val)})
         elif field == "area":
+            if val not in ("all", "113"):
+                await context.bot.send_message(cid, "Теперь доступны регионы: Весь мир и Россия.")
+                return
             storage.set_chat_state(_conn(context), cid, area=val)
             if _state(context, cid)["query_text"] != DEFAULT_QUERY:
                 storage.save_filter(_conn(context), cid, _state(context, cid)["query_text"], val)

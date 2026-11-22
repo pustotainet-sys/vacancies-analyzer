@@ -286,6 +286,43 @@ def test_default_query_is_marked_in_filter_row():
     assert query_buttons[1].text == "✏️ свой запрос", query_buttons
 
 
+def test_filter_region_buttons_only_offer_world_and_russia():
+    # Arrange
+    import bot
+    state = {"query_text": "python", "area": "all", "period_days": 30, "top_n": 15}
+    # Act
+    keyboard = bot.filter_kb(state)
+    regions = keyboard.inline_keyboard[0]
+    edit_regions = bot._edit_area_kb().inline_keyboard[0]
+    # Assert
+    assert [(button.text, button.callback_data) for button in regions] == [
+        ("• Весь мир", "area:all"), ("Россия", "area:113")], regions
+    assert [button.callback_data for button in edit_regions] == ["move:all", "move:113"], (
+        edit_regions)
+
+
+@pytest.mark.parametrize(("area", "expected_area"), [
+    pytest.param("all", None, id="world-omits-area"),
+    pytest.param("113", "113", id="russia-sets-area"),
+])
+def test_hh_search_region_parameters(monkeypatch, area, expected_area):
+    # Arrange
+    import hh_vacancies
+    searched = []
+
+    def fake_fetch_page(session, params, page):
+        searched.append(dict(params))
+        return {"found": 0, "pages": 0, "items": []}
+
+    monkeypatch.setattr(hh_vacancies, "fetch_page", fake_fetch_page)
+    # Act
+    hh_vacancies.fetch_vacancies(None, "python", area, 100, 200)
+    # Assert
+    actual_area = searched[0].get("area")
+    assert actual_area == expected_area, (
+        f"для {area} ожидался area={expected_area}, получено {actual_area}")
+
+
 def test_rename_filter_keeps_tracking_and_changes_selected_pair(conn):
     # Arrange
     import bot

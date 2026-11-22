@@ -325,8 +325,22 @@ def prune_raw(conn, tracked_days, adhoc_days=None):
         conn.commit()
 
 
+def prune_history(conn, history_days):
+    """Удалить старые снимки с агрегатами, завершённые задачи и суточные счётчики."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=history_days)
+    with _LOCK:
+        conn.execute("DELETE FROM snapshots WHERE ts_utc < ?", (cutoff.isoformat(),))
+        # tech_counts, cooccurrence и snapshot_items удаляются по ON DELETE CASCADE.
+        conn.execute("DELETE FROM vacancy_details WHERE vac_id NOT IN "
+                     "(SELECT vac_id FROM snapshot_items)")
+        conn.execute("DELETE FROM jobs WHERE status IN ('done', 'error') "
+                     "AND finished_at < ?", (cutoff.isoformat(),))
+        conn.execute("DELETE FROM daily_usage WHERE day < ?", (cutoff.date().isoformat(),))
+        conn.commit()
+
+
 def vacuum(conn):
-    """Сжать файл БД после массового удаления сырья."""
+    """Сжать файл БД после массового удаления старых данных."""
     with _LOCK:
         conn.execute("VACUUM")
 

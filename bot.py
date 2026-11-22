@@ -1435,6 +1435,7 @@ async def scheduled_tracked(context: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_vacuum(context: ContextTypes.DEFAULT_TYPE):
     conn = context.application.bot_data["conn"]
+    await asyncio.to_thread(collector.prune_expired, conn)
     await asyncio.to_thread(storage.vacuum, conn)
 
 

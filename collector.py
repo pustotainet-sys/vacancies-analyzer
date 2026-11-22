@@ -188,7 +188,7 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
         run_id = storage.write_snapshot(conn, meta, result, raw_rows)
         skill_map = skills_dict.merged_with_learned(storage.learned_map(conn))
         storage.upsert_learned(conn, result["raw_skills"], _known_aliases(skill_map))
-        storage.prune_raw(conn, _retention_days(), _adhoc_retention_days())
+        prune_expired(conn)
 
         top = sorted(result["df"].items(), key=lambda kv: -kv[1])[:10]
         return {"status": "ok", "run_id": run_id, "n": result["n"], "method": method,
@@ -217,9 +217,19 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
 
 
 def _retention_days():
-    return int(os.environ.get("RETENTION_RAW_DAYS", "90"))
+    return int(os.environ.get("RETENTION_RAW_DAYS", "30"))
 
 
 def _adhoc_retention_days():
     """Сырьё разовых запросов живёт коротко: истории по ним всё равно не копится."""
     return int(os.environ.get("RETENTION_ADHOC_DAYS", "7"))
+
+
+def _history_retention_days():
+    return int(os.environ.get("RETENTION_HISTORY_DAYS", "180"))
+
+
+def prune_expired(conn):
+    """Применить сроки хранения и к сырым вакансиям, и к истории снимков."""
+    storage.prune_raw(conn, _retention_days(), _adhoc_retention_days())
+    storage.prune_history(conn, _history_retention_days())

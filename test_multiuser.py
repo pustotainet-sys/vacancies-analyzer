@@ -7,6 +7,7 @@
 import asyncio
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -734,6 +735,85 @@ def test_prune_drops_adhoc_but_keeps_tracked(conn):
     assert len(storage.raw_vacancies(conn, tracked_run)) == 1
     assert storage.raw_vacancies(conn, adhoc_run) == []
     assert storage.get_vacancy(conn, "2") is None  # осиротевшая деталь удалена
+
+
+def test_tracked_raw_retention_is_30_days(conn):
+    # Arrange
+    import collector
+    recent = (datetime.now(timezone.utc) - timedelta(days=29)).isoformat()
+    expired = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    old_id = _snapshot(conn, "python", [_vac("old", expired)])
+    new_id = _snapshot(conn, "python", [_vac("new", recent)])
+    conn.execute("UPDATE snapshots SET ts_utc=? WHERE run_id=?", (expired, old_id))
+    conn.execute("UPDATE snapshots SET ts_utc=? WHERE run_id=?", (recent, new_id))
+    conn.commit()
+    jobs.track(conn, "python", "113", 1)
+    # Act
+    collector.prune_expired(conn)
+    # Assert
+    assert storage.raw_vacancies(conn, old_id) == [], "сырьё старше 30 дней осталось"
+    assert len(storage.raw_vacancies(conn, new_id)) == 1, "свежее сырьё удалено"
+    assert storage.get_vacancy(conn, "old") is None, "старое описание осталось"
+    assert storage.latest_ok_snapshot(conn, "python", "113") is not None, (
+        "снимки до 180 дней должны сохраняться")
+
+
+def test_history_retention_removes_old_snapshot_relations_and_jobs(conn):
+    # Arrange
+    old_time = (datetime.now(timezone.utc) - timedelta(days=181)).isoformat()
+    current_day = datetime.now(timezone.utc).date().isoformat()
+    old_day = (datetime.now(timezone.utc) - timedelta(days=181)).date().isoformat()
+    old_result = _result(1, {"Python": 1, "Docker": 1})
+    old_result["cooccur"] = {("Python", "Docker"): 1}
+    old_id = storage.write_snapshot(
+        conn, {"query_text": "old", "area": "113", "method": "llm"}, old_result,
+        [_vac("shared", old_time), _vac("old_only", old_time)])
+    new_id = _snapshot(conn, "new", [_vac("shared", current_day)])
+    conn.execute("UPDATE snapshots SET ts_utc=? WHERE run_id=?", (old_time, old_id))
+    old_job, _, _ = jobs.enqueue(conn, "collect", "old", "113", 200, None, 1)
+    jobs.finish(conn, old_job, "done", run_id=old_id)
+    conn.execute("UPDATE jobs SET finished_at=? WHERE job_id=?", (old_time, old_job))
+    active_job, _, _ = jobs.enqueue(conn, "collect", "new", "113", 200, None, 1)
+    conn.execute("INSERT INTO daily_usage(day,llm_jobs) VALUES(?,1)", (old_day,))
+    conn.execute("INSERT INTO daily_usage(day,llm_jobs) VALUES(?,1)", (current_day,))
+    storage.save_filter(conn, 1, "old", "113")
+    conn.commit()
+    # Act
+    storage.prune_history(conn, 180)
+    # Assert
+    assert conn.execute("SELECT 1 FROM snapshots WHERE run_id=?", (old_id,)).fetchone() is None
+    assert conn.execute("SELECT 1 FROM snapshots WHERE run_id=?", (new_id,)).fetchone(), (
+        "новый снимок удалён")
+    for table in ("tech_counts", "cooccurrence", "snapshot_items"):
+        count = conn.execute(f"SELECT count(*) FROM {table} WHERE run_id=?", (old_id,)).fetchone()[0]
+        assert count == 0, f"связанные данные остались в {table}"
+    assert storage.get_vacancy(conn, "old_only") is None, "осиротевшая вакансия осталась"
+    assert storage.get_vacancy(conn, "shared") is not None, "общая вакансия удалена"
+    assert conn.execute("SELECT 1 FROM jobs WHERE job_id=?", (old_job,)).fetchone() is None
+    assert conn.execute("SELECT 1 FROM job_watchers WHERE job_id=?", (old_job,)).fetchone() is None
+    assert conn.execute("SELECT 1 FROM jobs WHERE job_id=?", (active_job,)).fetchone()
+    days = [row["day"] for row in conn.execute("SELECT day FROM daily_usage")]
+    assert days == [current_day], f"неверные суточные счётчики: {days}"
+    assert storage.user_saved_filters(conn, 1) == [("old", "113")], (
+        "настройки пользователя не должны удаляться")
+
+
+def test_daily_maintenance_prunes_history_without_new_collect(conn, monkeypatch):
+    # Arrange
+    import bot
+    old_time = (datetime.now(timezone.utc) - timedelta(days=181)).isoformat()
+    old_id = _snapshot(conn, "old", [_vac("old_vac", old_time)])
+    conn.execute("UPDATE snapshots SET ts_utc=? WHERE run_id=?", (old_time, old_id))
+    conn.commit()
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    monkeypatch.setenv("RETENTION_HISTORY_DAYS", "180")
+    # Act
+    asyncio.run(bot.scheduled_vacuum(context))
+    # Assert
+    assert storage.last_snapshot(conn, "old", "113") is None, (
+        "ежедневная очистка не удалила старый снимок")
+    assert storage.get_vacancy(conn, "old_vac") is None, (
+        "ежедневная очистка не удалила осиротевшую вакансию")
 
 
 def test_migration_from_legacy_vacancies_table(tmp_path):

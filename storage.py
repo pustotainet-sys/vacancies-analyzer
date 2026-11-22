@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 _LOCK = threading.Lock()
 MSK = timezone(timedelta(hours=3))
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -95,6 +95,10 @@ CREATE TABLE IF NOT EXISTS job_watchers (
 CREATE TABLE IF NOT EXISTS tracked_queries (
     query_text TEXT NOT NULL, area TEXT NOT NULL, chat_id INTEGER NOT NULL,
     created_at TEXT, PRIMARY KEY (query_text, area, chat_id));
+
+CREATE TABLE IF NOT EXISTS saved_filters (
+    chat_id INTEGER NOT NULL, query_text TEXT NOT NULL, area TEXT NOT NULL,
+    created_at TEXT NOT NULL, PRIMARY KEY (chat_id, query_text, area));
 """
 
 
@@ -118,6 +122,15 @@ def init_schema(conn):
             pass  # колонка уже есть
         if "models_used_json" not in {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}:
             conn.execute("ALTER TABLE snapshots ADD COLUMN models_used_json TEXT")
+        seeded = conn.execute("SELECT 1 FROM meta WHERE key='saved_filters_seeded'").fetchone()
+        if not seeded:
+            conn.execute("INSERT OR IGNORE INTO saved_filters(chat_id, query_text, area, created_at) "
+                         "SELECT chat_id, query_text, area, COALESCE(created_at, '') "
+                         "FROM tracked_queries WHERE chat_id>0")
+            conn.execute("INSERT OR IGNORE INTO saved_filters(chat_id, query_text, area, created_at) "
+                         "SELECT chat_id, query_text, area, COALESCE(updated_at, '') "
+                         "FROM chat_state")
+            conn.execute("INSERT INTO meta(key, value) VALUES('saved_filters_seeded', '1')")
         conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
         conn.commit()
@@ -476,6 +489,29 @@ def set_chat_state(conn, chat_id, **fields):
     with _LOCK:
         conn.execute(f"UPDATE chat_state SET {cols} WHERE chat_id=?",
                      (*fields.values(), chat_id))
+        conn.commit()
+
+
+def save_filter(conn, chat_id, query_text, area):
+    ts_utc, _ = _now()
+    with _LOCK:
+        conn.execute("INSERT OR IGNORE INTO saved_filters(chat_id, query_text, area, created_at) "
+                     "VALUES(?,?,?,?)", (chat_id, query_text, str(area), ts_utc))
+        conn.commit()
+
+
+def user_saved_filters(conn, chat_id):
+    with _LOCK:
+        rows = conn.execute(
+            "SELECT query_text, area FROM saved_filters WHERE chat_id=? "
+            "ORDER BY created_at, rowid", (chat_id,)).fetchall()
+    return [(row["query_text"], row["area"]) for row in rows]
+
+
+def delete_filter(conn, chat_id, query_text, area):
+    with _LOCK:
+        conn.execute("DELETE FROM saved_filters WHERE chat_id=? AND query_text=? AND area=?",
+                     (chat_id, query_text, str(area)))
         conn.commit()
 
 

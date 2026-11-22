@@ -4,8 +4,10 @@
 именно её, а не рендеринг сообщений.
 """
 
+import asyncio
 import sqlite3
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -232,6 +234,199 @@ def test_track_is_idempotent_and_listed(conn):
     jobs.track(conn, "golang", "113", 1)
     assert jobs.user_tracked(conn, 1) == [("golang", "113")]
     assert jobs.tracked_count(conn) == 1
+
+
+def test_subscribers_exclude_system_and_other_queries(conn):
+    # Arrange
+    jobs.track(conn, "python", "113", 0)
+    jobs.track(conn, "python", "113", 1)
+    jobs.track(conn, "python", "113", 2)
+    jobs.track(conn, "python", "1", 3)
+    # Act
+    subscribers = jobs.subscribers(conn, "python", "113")
+    # Assert
+    assert sorted(subscribers) == [1, 2], f"ожидались чаты 1 и 2, получены {subscribers}"
+
+
+def test_saved_filters_are_buttons_with_selected_pair(conn):
+    # Arrange
+    import bot
+    storage.save_filter(conn, 1, "python", "113")
+    storage.save_filter(conn, 1, "golang", "1")
+    jobs.track(conn, "golang", "1", 1)
+    state = {"query_text": "golang", "area": "1", "period_days": 30, "top_n": 15}
+    # Act
+    keyboard = bot.filter_kb(state, True, storage.user_saved_filters(conn, 1),
+                             jobs.user_tracked(conn, 1))
+    saved = [button for row in keyboard.inline_keyboard for button in row
+             if button.callback_data.startswith("saved:")]
+    # Assert
+    assert len(saved) == 2, f"ожидались две кнопки, получено {len(saved)}"
+    assert saved[1].text.startswith("• 📌 golang /"), (
+        f"активная пара не отмечена: {saved[1].text}")
+    assert saved[1].callback_data.endswith(bot._saved_filter_token("golang", "1")), (
+        f"неверная привязка кнопки: {saved[1].callback_data}")
+
+
+def test_saved_filter_remains_after_untrack(conn):
+    # Arrange
+    storage.save_filter(conn, 1, "golang", "1")
+    jobs.track(conn, "golang", "1", 1)
+    # Act
+    jobs.untrack(conn, "golang", "1", 1)
+    # Assert
+    assert storage.user_saved_filters(conn, 1) == [("golang", "1")], (
+        "снятие отслеживания удалило сохранённый фильтр")
+
+
+def test_stale_saved_filter_button_cannot_select_other_pair():
+    # Arrange
+    import bot
+    before = [("python", "113"), ("golang", "1")]
+    callback_data = f"saved:1:{bot._saved_filter_token('golang', '1')}"
+    # Act
+    selected = bot._resolve_saved_filter(before, callback_data)
+    stale = bot._resolve_saved_filter([("python", "113"), ("rust", "1")], callback_data)
+    # Assert
+    assert selected == ("golang", "1"), f"не выбрана нужная пара: {selected}"
+    assert stale is None, f"устаревшая кнопка выбрала чужую пару: {stale}"
+
+
+def test_existing_tracked_filters_migrate_to_saved(tmp_path):
+    # Arrange
+    db_path = tmp_path / "existing.db"
+    conn = storage.connect(str(db_path))
+    storage.init_schema(conn)
+    jobs.track(conn, "golang", "1", 42)
+    conn.execute("DELETE FROM meta WHERE key='saved_filters_seeded'")
+    conn.commit()
+    # Act
+    storage.init_schema(conn)
+    saved = storage.user_saved_filters(conn, 42)
+    # Assert
+    assert saved == [("golang", "1")], f"старое отслеживание не перенесено: {saved}"
+    conn.close()
+
+
+def test_scheduled_filter_uses_llm_mode_and_skips_fresh_snapshot(conn, monkeypatch):
+    # Arrange
+    import bot
+    jobs.track(conn, bot.DEFAULT_QUERY, bot.DEFAULT_AREA, 0)
+    jobs.track(conn, "golang", "1", 1)
+    jobs.track(conn, "rust", "2", 1)
+    storage.write_snapshot(conn, {"query_text": "rust", "area": "2", "method": "llm"},
+                           _result(1, {"Rust": 1}), [])
+    monkeypatch.setattr(bot, "_wake_workers", lambda context: None)
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    asyncio.run(bot.scheduled_tracked(context))
+    queued = conn.execute("SELECT query_text, area, top_n, mode FROM jobs").fetchall()
+    # Assert
+    assert [tuple(row) for row in queued] == [("golang", "1", bot.ANALYZE_TOP_N, None)], (
+        f"неверные фоновые задачи: {[tuple(row) for row in queued]}")
+
+
+def test_failed_tracked_collect_waits_for_next_interval(conn, monkeypatch):
+    # Arrange
+    import bot
+    jobs.track(conn, "golang", "1", 1)
+    job_id, _, _ = jobs.enqueue(conn, "collect", "golang", "1", 200, None)
+    jobs.finish(conn, job_id, "error", error="temporary")
+    monkeypatch.setattr(bot, "_wake_workers", lambda context: None)
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    asyncio.run(bot.scheduled_tracked(context))
+    jobs_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    # Assert
+    assert jobs_count == 1, f"после недавней ошибки созданы повторные задачи: {jobs_count}"
+
+
+def test_top_change_tracks_rank_and_frequency(conn):
+    # Arrange
+    import analysis
+    first = _result(2, {"Python": 2, "Docker": 1})
+    first_id = storage.write_snapshot(
+        conn, {"query_text": "python", "area": "113", "method": "llm"}, first, [])
+    baseline = analysis.top_change(conn, "python", "113", first_id, 2)
+    second = _result(2, {"Docker": 2, "Kubernetes": 1})
+    second_id = storage.write_snapshot(
+        conn, {"query_text": "python", "area": "113", "method": "llm"}, second, [])
+    # Act
+    changes = analysis.top_change(conn, "python", "113", second_id, 2)
+    # Assert
+    assert baseline is None, f"первый снимок должен быть базой, получено {baseline}"
+    assert changes["entered"] == [("Kubernetes", 2, 1)], changes
+    assert changes["exited"] == [("Python", 1, 2)], changes
+    assert changes["changed"] == [("Docker", 2, 1, 1, 2)], changes
+
+
+def test_unchanged_top_has_no_notification(conn):
+    # Arrange
+    import analysis
+    import bot
+    first = _result(2, {"Python": 2})
+    storage.write_snapshot(conn, {"query_text": "python", "area": "113"}, first, [])
+    second_id = storage.write_snapshot(conn, {"query_text": "python", "area": "113"},
+                                       first, [])
+    # Act
+    changes = analysis.top_change(conn, "python", "113", second_id)
+    message = bot._top_change_text("python", "113", changes)
+    # Assert
+    assert message is None, f"без изменений уведомление не нужно: {message}"
+
+
+def test_top_change_notifies_only_subscribers_after_second_collect(conn):
+    # Arrange
+    import bot
+    sent = []
+
+    async def fake_send_message(chat_id, message, reply_markup=None):
+        sent.append((chat_id, message))
+
+    jobs.track(conn, "python", "113", 1)
+    jobs.track(conn, "python", "113", 2)
+    jobs.track(conn, "rust", "113", 3)
+    app = SimpleNamespace(bot_data={"conn": conn},
+                          bot=SimpleNamespace(send_message=fake_send_message))
+    job = {"kind": "collect", "query_text": "python", "area": "113"}
+    first_id = storage.write_snapshot(conn, {"query_text": "python", "area": "113",
+                                             "method": "llm"},
+                                      _result(1, {"Python": 1}), [])
+    asyncio.run(bot._notify_top_change(app, job, {"status": "ok", "run_id": first_id,
+                                                  "method": "llm"}))
+    second_id = storage.write_snapshot(conn, {"query_text": "python", "area": "113",
+                                              "method": "llm"},
+                                       _result(1, {"Docker": 1}), [])
+    # Act
+    asyncio.run(bot._notify_top_change(app, job, {"status": "ok", "run_id": second_id,
+                                                  "method": "llm"}))
+    # Assert
+    assert [chat_id for chat_id, _ in sent] == [1, 2], f"неверные получатели: {sent}"
+    assert all("Docker" in text and "Python" in text for _, text in sent), sent
+
+
+def test_basic_fallback_does_not_send_llm_top_alert(conn):
+    # Arrange
+    import bot
+    sent = []
+
+    async def fake_send_message(chat_id, message, reply_markup=None):
+        sent.append((chat_id, message))
+
+    jobs.track(conn, "python", "113", 1)
+    app = SimpleNamespace(bot_data={"conn": conn},
+                          bot=SimpleNamespace(send_message=fake_send_message))
+    job = {"kind": "collect", "query_text": "python", "area": "113"}
+    storage.write_snapshot(conn, {"query_text": "python", "area": "113", "method": "llm"},
+                           _result(1, {"Python": 1}), [])
+    fallback_id = storage.write_snapshot(
+        conn, {"query_text": "python", "area": "113", "method": "basic (откат с LLM)"},
+        _result(1, {"Docker": 1}), [])
+    # Act
+    asyncio.run(bot._notify_top_change(app, job, {"status": "ok", "run_id": fallback_id,
+                                                  "method": "basic (откат с LLM)"}))
+    # Assert
+    assert not sent, f"разные методики анализа нельзя сравнивать: {sent}"
 
 
 def test_tracked_pairs_ranked_by_subscribers(conn):

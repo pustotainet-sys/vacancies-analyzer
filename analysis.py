@@ -77,3 +77,24 @@ def diff_since_last(conn, query, area, top_n):
         return {"error": "need_two_snapshots"}
     return {"from": dict(P), "to": dict(L),
             **_classify(_shares(conn, L["run_id"]), _shares(conn, P["run_id"]), top_n)}
+
+
+def top_change(conn, query, area, run_id, top_n=15):
+    """Изменения мест и частот в топе конкретного нового снимка; None для первого."""
+    previous = storage.previous_ok_snapshot(conn, query, area, run_id)
+    if previous is None:
+        return None
+    before = sorted(storage.tech_counts(conn, previous["run_id"]).items(),
+                    key=lambda pair: (-pair[1]["df"], pair[0]))[:top_n]
+    after = sorted(storage.tech_counts(conn, run_id).items(),
+                   key=lambda pair: (-pair[1]["df"], pair[0]))[:top_n]
+    old = {name: (rank, stats["df"]) for rank, (name, stats) in enumerate(before, 1)}
+    new = {name: (rank, stats["df"]) for rank, (name, stats) in enumerate(after, 1)}
+    entered = [(name, *new[name]) for name in new.keys() - old.keys()]
+    exited = [(name, *old[name]) for name in old.keys() - new.keys()]
+    changed = [(name, *old[name], *new[name]) for name in new.keys() & old.keys()
+               if old[name] != new[name]]
+    entered.sort(key=lambda entry: entry[1])
+    exited.sort(key=lambda entry: entry[1])
+    changed.sort(key=lambda entry: entry[3])
+    return {"entered": entered, "exited": exited, "changed": changed}

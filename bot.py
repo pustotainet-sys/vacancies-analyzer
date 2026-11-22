@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -56,11 +57,12 @@ WORKERS = int(os.environ.get("WORKERS", "2"))
 QUEUE_POLL_SEC = 2.0
 LLM_QUOTA_USER = int(os.environ.get("LLM_DAILY_QUOTA_USER", "5"))
 LLM_QUOTA_GLOBAL = int(os.environ.get("LLM_DAILY_QUOTA_GLOBAL", "100"))
-TRACK_LIMIT_USER = int(os.environ.get("TRACK_LIMIT_USER", "2"))
+TRACK_LIMIT_USER = int(os.environ.get("TRACK_LIMIT_USER", "5"))
 TRACKED_MAX_TOTAL = int(os.environ.get("TRACKED_MAX_TOTAL", "40"))
-# подписки собираются реже дефолтного запроса и всегда базовым режимом: фон не должен
-# съедать ни бюджет LLM, ни лимиты hh
-TRACK_INTERVAL = int(float(os.environ.get("TRACK_COLLECT_HOURS", "24")) * 3600)
+# Подписки используют тот же интервал, что основной запрос; короткий опрос
+# расписания подхватывает новые фильтры без ожидания следующего шестичасового тика.
+TRACK_INTERVAL = COLLECT_INTERVAL
+TRACK_SWEEP_SECONDS = 900
 QUERY_MAX_LEN = 64
 
 AREA_NAMES = {"113": "Россия", "1": "Москва", "2": "СПб"}
@@ -340,10 +342,25 @@ def _mark(cur, val, label):
     return ("• " + label) if str(cur) == str(val) else label
 
 
-def filter_kb(state, tracked=False):
+def _saved_filter_token(query, area):
+    return hashlib.blake2s(f"{query}\0{area}".encode(), digest_size=4).hexdigest()
+
+
+def _resolve_saved_filter(saved_filters, callback_data):
+    try:
+        _, index_text, token = callback_data.split(":", 2)
+        if not index_text.isdecimal():
+            return None
+        query, area = saved_filters[int(index_text)]
+    except (ValueError, IndexError):
+        return None
+    return (query, area) if token == _saved_filter_token(query, area) else None
+
+
+def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
     a, p, n, q = state["area"], state["period_days"], state["top_n"], state["query_text"]
     track_label = "📌 Отслеживается — снять" if tracked else "📌 Отслеживать этот запрос"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(_mark(a, "113", "Россия"), callback_data="area:113"),
          InlineKeyboardButton(_mark(a, "1", "Москва"), callback_data="area:1"),
          InlineKeyboardButton(_mark(a, "2", "СПб"), callback_data="area:2")],
@@ -355,9 +372,26 @@ def filter_kb(state, tracked=False):
          InlineKeyboardButton(_mark(n, 30, "топ-30"), callback_data="topn:30")],
         [InlineKeyboardButton(_mark(q, "python", "python"), callback_data="text:python"),
          InlineKeyboardButton("✏️ свой запрос", callback_data="text:custom")],
-        [InlineKeyboardButton(track_label, callback_data="track")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="home")],
-    ])
+    ]
+    for index, (query, area) in enumerate(saved_filters):
+        pin = "📌 " if (query, str(area)) in tracked_filters else ""
+        label = f"{pin}{query} / {_area_label(area)}"
+        if q == query and str(a) == str(area):
+            label = "• " + label
+        rows.append([InlineKeyboardButton(
+            label[:60], callback_data=f"saved:{index}:{_saved_filter_token(query, area)}")])
+    rows.extend([[InlineKeyboardButton(track_label, callback_data="track")],
+                 [InlineKeyboardButton("🗑 Удалить текущий фильтр", callback_data="delete_filter")],
+                 [InlineKeyboardButton("⬅️ Назад", callback_data="home")]])
+    return InlineKeyboardMarkup(rows)
+
+
+def _filter_kb(context, chat_id, state):
+    conn = _conn(context)
+    saved = storage.user_saved_filters(conn, chat_id)
+    tracked = jobs.user_tracked(conn, chat_id)
+    active = (state["query_text"], str(state["area"])) in tracked
+    return filter_kb(state, active, saved, tracked)
 
 
 MENU_TEXT = ("Анализ требований вакансий hh.ru.\n"
@@ -383,18 +417,18 @@ async def _send_messages(bot, chat_id, messages, keyboard=None):
 
 # --- команды -----------------------------------------------------------------
 HELP = (
-    "Бот анализирует, какие технологии требуют в вакансиях hh.ru (без ИИ, "
-    "по key_skills и тексту описаний).\n\n"
+    "Бот анализирует требования вакансий hh.ru через LLM. Если модели недоступны, "
+    "использует базовый словарный анализ.\n\n"
     "📊 Топ требований — самые частые технологии сейчас\n"
     "📋 Вакансии — список актуальных вакансий, по кнопке — подробности\n"
     "📈 Тренд за месяц — что выросло/упало/появилось/исчезло\n"
     "🔁 Что изменилось — дифф с прошлого сбора\n"
-    "⚙️ Фильтры — регион, период, размер топа, свой запрос\n"
+    "⚙️ Фильтры — регион, период, размер топа, сохранённые запросы\n"
     "⟳ Загрузить свежие (кнопка) или /refresh — скачать свежие вакансии и пересчитать\n"
     "🧠 Проанализировать заново (LLM) — пересчитать топ по уже загруженным, без hh\n"
     "/reanalyze_llm, /reanalyze_basic — то же командой (LLM или по словарю)\n"
-    "📌 /track — копить историю по своему запросу (тогда заработают тренды),\n"
-    "/untrack, /tracked — снять и посмотреть список\n\n"
+    "📌 /track — собирать выбранный фильтр каждые 6 часов и получать изменения топа,\n"
+    "/untrack, /tracked — снять отслеживание и посмотреть список\n\n"
     "Сборы идут через общую очередь: если запрос уже считается для кого-то другого, "
     "вы просто подпишетесь на его результат."
 )
@@ -439,8 +473,9 @@ async def cmd_diff(update, context):
 async def cmd_filters(update, context):
     if not await _pass(update, context):
         return
-    st = _state(context, update.effective_chat.id)
-    await update.message.reply_text(FILTER_TEXT, reply_markup=filter_kb(st))
+    cid = update.effective_chat.id
+    st = _state(context, cid)
+    await update.message.reply_text(FILTER_TEXT, reply_markup=_filter_kb(context, cid, st))
 
 
 async def cmd_status(update, context):
@@ -468,8 +503,22 @@ async def cmd_status(update, context):
     else:
         lines.append("По этому запросу сборов ещё не было.")
     if tracked:
-        lines.append("Отслеживается (тренды): "
-                     + "; ".join(f"{q} / {_area_label(a)}" for q, a in tracked))
+        lines.append("Отслеживаемые фильтры:")
+        for query, area in tracked:
+            snapshot = storage.latest_ok_snapshot(conn, query, area)
+            finished = jobs.last_collect_finished(conn, query, area)
+            latest_times = ([datetime.fromisoformat(snapshot["ts_utc"])] if snapshot else [])
+            if finished:
+                latest_times.append(datetime.fromisoformat(finished))
+            if jobs.has_active(conn, "collect", query, area, None):
+                schedule = "сбор в очереди или в работе"
+            elif latest_times:
+                due = (max(latest_times) + timedelta(seconds=TRACK_INTERVAL)).astimezone(
+                    storage.MSK)
+                schedule = f"следующий сбор около {due:%d.%m %H:%M} МСК"
+            else:
+                schedule = "первый сбор ожидается"
+            lines.append(f"• {query} / {_area_label(area)} — {schedule}")
     else:
         lines.append("Отслеживаемых запросов нет — /track добавит текущий.")
     lines.append(f"Очередь: {queued} ждут, {running} в работе.")
@@ -581,11 +630,6 @@ async def cmd_collect(update, context):
 
 
 # --- подписки на запрос (история и тренды) -----------------------------------
-def _tracked_now(context, st):
-    mine = jobs.user_tracked(_conn(context), st["chat_id"])
-    return (st["query_text"], str(st["area"])) in [(q, str(a)) for q, a in mine]
-
-
 async def _do_track(context, chat_id):
     """Переключить отслеживание активного запроса: снять, если уже стоит."""
     conn = _conn(context)
@@ -608,9 +652,15 @@ async def _do_track(context, chat_id):
                      "фоновый сбор больше не потянет. Попробуйте позже.")
         return
     jobs.track(conn, query, area, chat_id)
+    storage.save_filter(conn, chat_id, query, area)
+    latest = storage.latest_ok_snapshot(conn, query, area)
+    if not latest or _snapshot_age(latest) >= COLLECT_INTERVAL:
+        jobs.enqueue(conn, "collect", query, area, ANALYZE_TOP_N, None, None)
+        _wake_workers(context)
     await context.bot.send_message(
         chat_id, f"Отслеживаю: {query} / {_area_label(area)}. Раз в "
-                 f"{TRACK_INTERVAL/3600:g} ч буду собирать снимок — через пару сборов "
+                 f"{TRACK_INTERVAL/3600:g} ч буду собирать снимок с LLM и сообщать "
+                 "об изменениях топа — через пару сборов "
                  f"заработают «Тренд» и «Что изменилось».")
 
 
@@ -701,7 +751,7 @@ async def on_reply_button(update, context):
     elif action == "flt":
         st = _state(context, cid)
         await context.bot.send_message(cid, FILTER_TEXT,
-                                       reply_markup=filter_kb(st, _tracked_now(context, st)))
+                                       reply_markup=_filter_kb(context, cid, st))
     elif action == "admin":
         if not await _admin_only(update, context):
             return ConversationHandler.END
@@ -813,15 +863,34 @@ async def on_callback(update, context):
     elif data == "track":
         await _do_track(context, cid)
         st = _state(context, cid)
-        await q.edit_message_reply_markup(reply_markup=filter_kb(st, _tracked_now(context, st)))
+        await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
     elif data.startswith("adm:"):
         await _on_admin_callback(update, context, cid, data[len("adm:"):])
     elif data == "flt":
         st = _state(context, cid)
         await q.edit_message_text(FILTER_TEXT,
-                                  reply_markup=filter_kb(st, _tracked_now(context, st)))
+                                  reply_markup=_filter_kb(context, cid, st))
     elif data == "home":
         await q.edit_message_text(MENU_TEXT, reply_markup=main_kb())
+    elif data.startswith("saved:"):
+        saved = storage.user_saved_filters(_conn(context), cid)
+        pair = _resolve_saved_filter(saved, data)
+        if pair is None:
+            await q.answer("Список изменился — откройте фильтры заново.", show_alert=True)
+            return
+        query, area = pair
+        storage.set_chat_state(_conn(context), cid, query_text=query, area=area)
+        st = _state(context, cid)
+        await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
+    elif data == "delete_filter":
+        st = _state(context, cid)
+        conn = _conn(context)
+        query, area = st["query_text"], str(st["area"])
+        jobs.untrack(conn, query, area, cid)
+        storage.delete_filter(conn, cid, query, area)
+        storage.set_chat_state(conn, cid, query_text=DEFAULT_QUERY, area=DEFAULT_AREA)
+        st = _state(context, cid)
+        await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
     elif ":" in data:
         key, _, val = data.partition(":")
         field = {"area": "area", "period": "period_days", "topn": "top_n",
@@ -833,9 +902,10 @@ async def on_callback(update, context):
             storage.set_chat_state(_conn(context), cid, **{field: int(val)})
         elif field == "area":
             storage.set_chat_state(_conn(context), cid, area=val)
+            if _state(context, cid)["query_text"] != DEFAULT_QUERY:
+                storage.save_filter(_conn(context), cid, _state(context, cid)["query_text"], val)
         st = _state(context, cid)
-        await q.edit_message_reply_markup(reply_markup=filter_kb(st,
-                                                                 _tracked_now(context, st)))
+        await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
 
 
 # --- ConversationHandler: свой запрос ---------------------------------------
@@ -855,6 +925,7 @@ async def save_custom(update, context):
                                         reply_markup=main_kb())
         return ConversationHandler.END
     storage.set_chat_state(_conn(context), cid, query_text=text)
+    storage.save_filter(_conn(context), cid, text, _state(context, cid)["area"])
     await update.message.reply_text(
         f"Запрос установлен: «{text}». Историю по нему можно копить командой /track.",
         reply_markup=main_kb())
@@ -1088,6 +1159,39 @@ async def _announce_result(app, job, res):
         await _send_messages(app.bot, cid, render_top(top, st), main_kb())
 
 
+def _top_change_text(query, area, changes):
+    if not any(changes.values()):
+        return None
+    lines = [f"🔔 Изменился топ требований: {query} / {_area_label(area)}"]
+    for name, rank, count in changes["entered"]:
+        lines.append(f"➕ {name[:65]}: #{rank}, {count} вакансий")
+    for name, rank, count in changes["exited"]:
+        lines.append(f"➖ {name[:65]}: было #{rank}, {count} вакансий")
+    for name, old_rank, old_count, new_rank, new_count in changes["changed"]:
+        lines.append(f"↕️ {name[:65]}: #{old_rank} → #{new_rank}, "
+                     f"{old_count} → {new_count} вакансий")
+    return "\n".join(lines)[:TG_LIMIT]
+
+
+async def _notify_top_change(app, job, res):
+    if job["kind"] != "collect" or res.get("status") != "ok" or res.get("method") != "llm":
+        return
+    conn = app.bot_data["conn"]
+    recipients = jobs.subscribers(conn, job["query_text"], job["area"])
+    if not recipients:
+        return
+    previous = storage.previous_ok_snapshot(conn, job["query_text"], job["area"],
+                                            res["run_id"])
+    if previous is None or previous["method"] != "llm":
+        return
+    changes = analysis.top_change(conn, job["query_text"], job["area"], res["run_id"])
+    if changes is None:
+        return
+    message = _top_change_text(job["query_text"], job["area"], changes)
+    if message:
+        await _notify(app.bot, recipients, message)
+
+
 async def _run_job(app, job):
     conn = app.bot_data["conn"]
     loop = asyncio.get_running_loop()
@@ -1117,6 +1221,7 @@ async def _run_job(app, job):
                 run_id=res.get("run_id"), method=res.get("method"), n=res.get("n"),
                 error=res.get("error") or res.get("status") if not ok else None)
     await _announce_result(app, job, res)
+    await _notify_top_change(app, job, res)
     if not ok and ADMINS:
         await _notify(app.bot, [int(a) for a in ADMINS],
                       f"⚠️ Задача {job['job_id']} ({job['query_text']}) упала: "
@@ -1155,7 +1260,7 @@ async def scheduled_default(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scheduled_tracked(context: ContextTypes.DEFAULT_TYPE):
-    """Пользовательские подписки: реже, базовым режимом и с потолком по числу пар.
+    """Пользовательские подписки: шестичасовой сбор с LLM.
 
     Дедуп в enqueue схлопнет пары, которые уже стоят в очереди.
     """
@@ -1165,8 +1270,15 @@ async def scheduled_tracked(context: ContextTypes.DEFAULT_TYPE):
     for query, area, _subs in pairs:
         if query == DEFAULT_QUERY and str(area) == str(DEFAULT_AREA):
             continue  # у него свой, более частый джоб
+        latest = storage.latest_ok_snapshot(conn, query, area)
+        if latest and _snapshot_age(latest) < TRACK_INTERVAL:
+            continue
+        finished = jobs.last_collect_finished(conn, query, area)
+        if finished and (datetime.now(timezone.utc)
+                         - datetime.fromisoformat(finished)).total_seconds() < TRACK_INTERVAL:
+            continue
         _, deduped, _ = jobs.enqueue(conn, "collect", query, area,
-                                     ONDEMAND_TOP_N, "basic", None)
+                                     ANALYZE_TOP_N, None, None)
         queued += 0 if deduped else 1
     total = jobs.tracked_count(conn)
     if total > TRACKED_MAX_TOTAL:
@@ -1181,12 +1293,16 @@ async def scheduled_vacuum(context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(storage.vacuum, conn)
 
 
+def _snapshot_age(snapshot):
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(snapshot["ts_utc"])).total_seconds()
+
+
 def _first_delay(conn):
     """Задержка до первого сбора: пусто/устарело -> сразу, иначе остаток интервала."""
     L = storage.latest_ok_snapshot(conn, DEFAULT_QUERY, DEFAULT_AREA)
     if not L:
         return 5
-    age = (datetime.now(timezone.utc) - datetime.fromisoformat(L["ts_utc"])).total_seconds()
+    age = _snapshot_age(L)
     return 5 if age >= COLLECT_INTERVAL else max(5, COLLECT_INTERVAL - age)
 
 
@@ -1338,11 +1454,11 @@ def main():
         print("Кэш пуст или устарел — сбор при старте", flush=True)
     app.job_queue.run_repeating(scheduled_default, interval=COLLECT_INTERVAL,
                                 first=delay, name="collect")
-    app.job_queue.run_repeating(scheduled_tracked, interval=TRACK_INTERVAL,
-                                first=max(60, delay + 60), name="tracked")
+    app.job_queue.run_repeating(scheduled_tracked, interval=TRACK_SWEEP_SECONDS,
+                                first=60, name="tracked")
     app.job_queue.run_repeating(scheduled_vacuum, interval=86400, first=3600, name="vacuum")
-    print(f"Бот запущен. Автосбор каждые {COLLECT_INTERVAL/3600:g} ч; "
-          f"подписки — каждые {TRACK_INTERVAL/3600:g} ч.", flush=True)
+    print(f"Бот запущен. Автосбор и подписки каждые {COLLECT_INTERVAL/3600:g} ч.",
+          flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

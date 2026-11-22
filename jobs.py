@@ -148,6 +148,16 @@ def stats_24h(conn):
     return by.get("done", 0), by.get("error", 0)
 
 
+def last_collect_finished(conn, query_text, area):
+    """Время последней завершённой попытки сбора, включая неудачную."""
+    with _LOCK:
+        row = conn.execute(
+            "SELECT finished_at FROM jobs WHERE kind='collect' AND query_text=? "
+            "AND area=? AND finished_at IS NOT NULL ORDER BY job_id DESC LIMIT 1",
+            (query_text, str(area))).fetchone()
+    return row["finished_at"] if row else None
+
+
 # --- отслеживаемые запросы (подписки) ----------------------------------------
 def track(conn, query_text, area, chat_id):
     ts_utc, _ = _now()
@@ -173,6 +183,15 @@ def user_tracked(conn, chat_id):
             "SELECT query_text, area FROM tracked_queries WHERE chat_id=? ORDER BY created_at",
             (chat_id,)).fetchall()
     return [(r["query_text"], r["area"]) for r in rows]
+
+
+def subscribers(conn, query_text, area):
+    """Чаты, подписанные на изменения конкретного запроса (без системной подписки)."""
+    with _LOCK:
+        rows = conn.execute(
+            "SELECT chat_id FROM tracked_queries WHERE query_text=? AND area=? AND chat_id>0",
+            (query_text, str(area))).fetchall()
+    return [row["chat_id"] for row in rows]
 
 
 def is_tracked(conn, query_text, area):

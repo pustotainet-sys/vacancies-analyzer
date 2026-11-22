@@ -620,8 +620,11 @@ def set_user_status(conn, chat_id, status):
 def list_users(conn, limit=50):
     with _LOCK:
         rows = conn.execute(
-            "SELECT chat_id, username, status, first_seen, last_seen, llm_jobs_today "
-            "FROM users ORDER BY last_seen DESC LIMIT ?", (limit,)).fetchall()
+            "SELECT u.chat_id, u.username, u.status, u.first_seen, u.last_seen, "
+            "u.llm_jobs_today, "
+            "(SELECT COUNT(*) FROM saved_filters f WHERE f.chat_id = u.chat_id) "
+            "AS saved_filter_count "
+            "FROM users u ORDER BY u.last_seen DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
 

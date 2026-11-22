@@ -198,6 +198,19 @@ def test_quota_left_reports_remaining(conn):
 
 
 # --- инвайты и доступ --------------------------------------------------------
+def test_list_users_includes_saved_filter_count(conn):
+    storage.register_user(conn, 1, username="alice")
+    storage.register_user(conn, 2, username="bob")
+    storage.save_filter(conn, 1, "python", "all")
+    storage.save_filter(conn, 1, "python", "113")
+    storage.save_filter(conn, 1, "python", "all")
+
+    users = {user["chat_id"]: user for user in storage.list_users(conn)}
+
+    assert users[1]["saved_filter_count"] == 2, "у первого пользователя должно быть два фильтра"
+    assert users[2]["saved_filter_count"] == 0, "у второго пользователя фильтров нет"
+
+
 def test_invite_redeems_once(conn):
     storage.create_invite(conn, "CODE", 1, max_uses=1)
     assert storage.redeem_invite(conn, "CODE", 777) == "ok"

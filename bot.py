@@ -1179,7 +1179,9 @@ async def _do_users(context, chat_id):
     for u in rows:
         flag = "🚫" if u["status"] == "banned" else "  "
         name = u["username"] or "—"
-        lines.append(f"{flag} {u['chat_id']}  @{name}  LLM сегодня: {u['llm_jobs_today']}")
+        lines.append(f"{flag} {u['chat_id']}  @{name}  "
+                     f"фильтров: {u['saved_filter_count']}  "
+                     f"LLM сегодня: {u['llm_jobs_today']}")
     await _send_messages(context.bot, chat_id, _chunk(lines, ""))
 
 

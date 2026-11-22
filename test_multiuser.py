@@ -268,7 +268,7 @@ def test_saved_filters_are_buttons_with_selected_pair(conn):
         f"неверная привязка кнопки: {saved[1].callback_data}")
     query_buttons = keyboard.inline_keyboard[3]
     assert query_buttons[0].text == "python", query_buttons
-    assert query_buttons[1].text == "• ✏️ golang", query_buttons
+    assert query_buttons[1].text == "✏️ golang", query_buttons
     assert query_buttons[1].callback_data == "edit_filter", query_buttons
     assert any(button.callback_data == "text:custom"
                for row in keyboard.inline_keyboard for button in row), (
@@ -283,7 +283,85 @@ def test_default_query_is_marked_in_filter_row():
     query_buttons = bot.filter_kb(state).inline_keyboard[3]
     # Assert
     assert query_buttons[0].text == "• python", query_buttons
-    assert query_buttons[1].text == "✏️ свой запрос", query_buttons
+    assert len(query_buttons) == 1, query_buttons
+    assert bot.filter_kb(state).inline_keyboard[4][0].text == "➕ Новый запрос"
+
+
+def test_change_region_replaces_saved_filter_and_preserves_tracking(conn, monkeypatch):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.set_chat_state(conn, 1, query_text="ai ии", area="113")
+    storage.save_filter(conn, 1, "ai ии", "113")
+    jobs.track(conn, "ai ии", "113", 1)
+    monkeypatch.setattr(bot, "_wake_workers", lambda context: None)
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    status = bot._change_selected_area(context, 1, "all")
+    # Assert
+    assert status == "renamed", f"регион не изменён: {status}"
+    assert storage.user_saved_filters(conn, 1) == [("ai ии", "all")], (
+        "смена региона создала дубликат")
+    assert jobs.user_tracked(conn, 1) == [("ai ии", "all")], (
+        "отслеживание осталось на старом регионе")
+    queued = conn.execute("SELECT query_text,area FROM jobs WHERE status='queued'").fetchall()
+    assert [tuple(row) for row in queued] == [("ai ии", "all")], queued
+
+
+def test_select_python_uses_existing_saved_pair(conn):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.save_filter(conn, 1, "python", "113")
+    storage.save_filter(conn, 1, "ai ии", "all")
+    storage.set_chat_state(conn, 1, query_text="ai ии", area="all")
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    bot._select_python_filter(context, 1)
+    state = storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    # Assert
+    assert (state["query_text"], state["area"]) == ("python", "113"), state
+    assert storage.user_saved_filters(conn, 1) == [("python", "113"), ("ai ии", "all")], (
+        "выбор python создал лишний фильтр")
+
+
+def test_python_filter_can_move_to_world(conn, monkeypatch):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.save_filter(conn, 1, "python", "113")
+    jobs.track(conn, "python", "113", 0)
+    jobs.track(conn, "python", "113", 1)
+    monkeypatch.setattr(bot, "_wake_workers", lambda context: None)
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    status = bot._change_selected_area(context, 1, "all")
+    # Assert
+    assert status == "renamed", f"python не переключился на весь мир: {status}"
+    assert storage.user_saved_filters(conn, 1) == [("python", "all")], (
+        "остался лишний фильтр python / Россия")
+    assert jobs.user_tracked(conn, 1) == [("python", "all")], (
+        "пользовательское отслеживание не перенеслось")
+    assert jobs.subscribers(conn, "python", "113") == [], (
+        "системный фильтр не должен учитываться как подписчик")
+
+
+def test_region_button_selects_existing_pair_instead_of_merging(conn):
+    # Arrange
+    import bot
+    storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    storage.save_filter(conn, 1, "ai ии", "113")
+    storage.save_filter(conn, 1, "ai ии", "all")
+    storage.set_chat_state(conn, 1, query_text="ai ии", area="113")
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"conn": conn}))
+    # Act
+    status = bot._change_selected_area(context, 1, "all")
+    state = storage.get_chat_state(conn, 1, bot.STATE_DEFAULTS)
+    # Assert
+    assert status == "selected", f"существующая пара не выбрана: {status}"
+    assert state["area"] == "all", state
+    assert storage.user_saved_filters(conn, 1) == [("ai ии", "113"), ("ai ии", "all")], (
+        "существующие разные пары должны сохраниться")
 
 
 def test_filter_region_buttons_only_offer_world_and_russia():

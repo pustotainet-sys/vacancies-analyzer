@@ -361,6 +361,11 @@ def _resolve_saved_filter(saved_filters, callback_data):
 def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
     a, p, n, q = state["area"], state["period_days"], state["top_n"], state["query_text"]
     track_label = "📌 Отслеживается — снять" if tracked else "📌 Отслеживать этот запрос"
+    current_saved = (q, str(a)) in saved_filters
+    query_row = [InlineKeyboardButton(_mark(q, "python", "python"),
+                                     callback_data="text:python")]
+    if current_saved:
+        query_row.append(InlineKeyboardButton(f"✏️ {q[:24]}", callback_data="edit_filter"))
     rows = [
         [InlineKeyboardButton(_mark(a, "all", "Весь мир"), callback_data="area:all"),
          InlineKeyboardButton(_mark(a, "113", "Россия"), callback_data="area:113")],
@@ -370,13 +375,9 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
         [InlineKeyboardButton(_mark(n, 10, "топ-10"), callback_data="topn:10"),
          InlineKeyboardButton(_mark(n, 15, "топ-15"), callback_data="topn:15"),
          InlineKeyboardButton(_mark(n, 30, "топ-30"), callback_data="topn:30")],
-        [InlineKeyboardButton(_mark(q, "python", "python"), callback_data="text:python"),
-         InlineKeyboardButton(f"• ✏️ {q[:24]}" if q != "python" else "✏️ свой запрос",
-                              callback_data="edit_filter" if q != "python"
-                              else "text:custom")],
+        query_row,
+        [InlineKeyboardButton("➕ Новый запрос", callback_data="text:custom")],
     ]
-    if q != "python":
-        rows.append([InlineKeyboardButton("➕ Новый запрос", callback_data="text:custom")])
     for index, (query, area) in enumerate(saved_filters):
         pin = "📌 " if (query, str(area)) in tracked_filters else ""
         label = f"{pin}{query} / {_area_label(area)}"
@@ -384,9 +385,6 @@ def filter_kb(state, tracked=False, saved_filters=(), tracked_filters=()):
             label = "• " + label
         rows.append([InlineKeyboardButton(
             label[:60], callback_data=f"saved:{index}:{_saved_filter_token(query, area)}")])
-    if (q, str(a)) in saved_filters:
-        rows.append([InlineKeyboardButton("🌍 Исправить регион фильтра",
-                                          callback_data="edit_area")])
     rows.extend([[InlineKeyboardButton(track_label, callback_data="track")],
                  [InlineKeyboardButton("🗑 Удалить текущий фильтр", callback_data="delete_filter")],
                  [InlineKeyboardButton("⬅️ Назад", callback_data="home")]])
@@ -425,6 +423,35 @@ def _rename_saved_filter(context, chat_id, old_query, old_area, new_query, new_a
             jobs.enqueue(conn, "collect", new_query, new_area, ANALYZE_TOP_N, None, None)
             _wake_workers(context)
     return status
+
+
+def _change_selected_area(context, chat_id, new_area):
+    conn = _conn(context)
+    st = _state(context, chat_id)
+    query, old_area = st["query_text"], str(st["area"])
+    if old_area == new_area:
+        return "unchanged"
+    saved = storage.user_saved_filters(conn, chat_id)
+    if (query, old_area) in saved:
+        if (query, new_area) in saved:
+            storage.set_chat_state(conn, chat_id, area=new_area)
+            return "selected"
+        return _rename_saved_filter(context, chat_id, query, old_area, query, new_area)
+    storage.set_chat_state(conn, chat_id, area=new_area)
+    storage.save_filter(conn, chat_id, query, new_area)
+    return "created"
+
+
+def _select_python_filter(context, chat_id):
+    conn = _conn(context)
+    current_area = str(_state(context, chat_id)["area"])
+    saved = storage.user_saved_filters(conn, chat_id)
+    python_areas = [area for query, area in saved if query == "python"]
+    selected_area = (current_area if current_area in python_areas else
+                     python_areas[0] if python_areas else current_area)
+    storage.set_chat_state(conn, chat_id, query_text="python", area=selected_area)
+    if not python_areas:
+        storage.save_filter(conn, chat_id, "python", selected_area)
 
 
 MENU_TEXT = ("Анализ требований вакансий hh.ru.\n"
@@ -952,17 +979,18 @@ async def on_callback(update, context):
         field = {"area": "area", "period": "period_days", "topn": "top_n",
                  "text": "query_text"}.get(key)
         if field == "query_text":
-            val = "python"  # text:python; text:custom обрабатывает ConversationHandler
-            storage.set_chat_state(_conn(context), cid, query_text=val)
+            _select_python_filter(context, cid)
         elif field in ("period_days", "top_n"):
             storage.set_chat_state(_conn(context), cid, **{field: int(val)})
         elif field == "area":
             if val not in ("all", "113"):
                 await context.bot.send_message(cid, "Теперь доступны регионы: Весь мир и Россия.")
                 return
-            storage.set_chat_state(_conn(context), cid, area=val)
-            if _state(context, cid)["query_text"] != DEFAULT_QUERY:
-                storage.save_filter(_conn(context), cid, _state(context, cid)["query_text"], val)
+            status = _change_selected_area(context, cid, val)
+            if status == "limit":
+                await context.bot.send_message(
+                    cid, "Достигнут общий лимит отслеживаемых фильтров.")
+                return
         st = _state(context, cid)
         await q.edit_message_reply_markup(reply_markup=_filter_kb(context, cid, st))
 

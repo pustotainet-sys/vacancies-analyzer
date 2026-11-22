@@ -124,8 +124,8 @@ def fetch_vacancies(session, text, area, per_page, max_items, extra_params=None,
     }
     if area not in (None, "", "all"):
         params["area"] = area
-    # Без search_field hh ищет по всем полям. Бот по умолчанию задаёт name,
-    # чтобы не собирать вакансии по совпадению в названии компании или описании.
+    # Без search_field hh ищет по всем полям. Список значений requests передаёт
+    # повторяющимися search_field; строка "name,description" у hh не работает.
     if search_field:
         params["search_field"] = search_field
     if extra_params:

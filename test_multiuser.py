@@ -537,7 +537,7 @@ def test_hh_search_region_parameters(monkeypatch, area, expected_area):
         f"для {area} ожидался area={expected_area}, получено {actual_area}")
 
 
-def test_collector_searches_titles_by_relevance(conn, monkeypatch):
+def test_collector_searches_titles_and_descriptions_by_relevance(conn, monkeypatch):
     # Arrange
     import collector
     seen = {}
@@ -557,7 +557,27 @@ def test_collector_searches_titles_by_relevance(conn, monkeypatch):
     # Assert
     assert outcome["status"] == "ok", outcome
     assert seen == {"text": "системная аналитика", "order": "relevance",
-                    "field": "name"}, seen
+                    "field": ["name", "description"]}, seen
+
+
+def test_hh_encodes_multiple_search_fields(monkeypatch):
+    # Arrange
+    import hh_vacancies
+    import requests
+    captured = []
+
+    def fake_fetch_page(session, params, page):
+        captured.append(dict(params))
+        return {"found": 0, "pages": 0, "items": []}
+
+    monkeypatch.setattr(hh_vacancies, "fetch_page", fake_fetch_page)
+    # Act
+    hh_vacancies.fetch_vacancies(None, "системная аналитика", "113", 100, 100,
+                                search_field=["name", "description"])
+    url = requests.Request("GET", hh_vacancies.API_URL, params=captured[0]).prepare().url
+    # Assert
+    assert url.count("search_field=") == 2, url
+    assert "search_field=name" in url and "search_field=description" in url, url
 
 
 def test_rename_filter_keeps_tracking_and_changes_selected_pair(conn):

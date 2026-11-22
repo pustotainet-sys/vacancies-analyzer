@@ -136,9 +136,11 @@ def collect_once(conn, query, area, analyze_top_n, throttle=0.2, progress=None, 
     try:
         with _hh_sem:  # сеть к hh — строго последовательно: общий токен приложения и один IP
             session = build_session()
-            # Поиск по всем полям ловит совпадения в названии компании и описании:
-            # например, врачей из «Аналитик-Центр» по запросу «системная аналитика».
-            search_field = os.environ.get("HH_SEARCH_FIELD", "name") or None
+            # Ищем по названию и описанию, исключая название компании: иначе
+            # «системная аналитика» находит врачей из «Аналитик-Центр».
+            search_field = [field.strip() for field in
+                            os.environ.get("HH_SEARCH_FIELD", "name,description").split(",")
+                            if field.strip()] or None
             items, total_found = fetch_vacancies(
                 session, query, area, per_page=100, max_items=analyze_top_n,
                 extra_params={"order_by": "relevance"}, search_field=search_field)

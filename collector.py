@@ -225,11 +225,11 @@ def _adhoc_retention_days():
     return int(os.environ.get("RETENTION_ADHOC_DAYS", "7"))
 
 
-def _history_retention_days():
+def history_retention_days():
     return int(os.environ.get("RETENTION_HISTORY_DAYS", "180"))
 
 
 def prune_expired(conn):
     """Применить сроки хранения и к сырым вакансиям, и к истории снимков."""
     storage.prune_raw(conn, _retention_days(), _adhoc_retention_days())
-    storage.prune_history(conn, _history_retention_days())
+    storage.prune_history(conn, history_retention_days())

@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -814,6 +815,25 @@ def test_daily_maintenance_prunes_history_without_new_collect(conn, monkeypatch)
         "ежедневная очистка не удалила старый снимок")
     assert storage.get_vacancy(conn, "old_vac") is None, (
         "ежедневная очистка не удалила осиротевшую вакансию")
+
+
+def test_backup_retention_only_removes_expired_deployment_copies(tmp_path):
+    # Arrange
+    db_path = tmp_path / "hh_stats.db"
+    old_backup = tmp_path / "hh_stats.db.pre-old"
+    recent_backup = tmp_path / "hh_stats.db.pre-recent"
+    unrelated = tmp_path / "notes.txt"
+    for path in (old_backup, recent_backup, unrelated):
+        path.write_text("test")
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=181)).timestamp()
+    os.utime(old_backup, (old_timestamp, old_timestamp))
+    os.utime(unrelated, (old_timestamp, old_timestamp))
+    # Act
+    storage.prune_backups(str(db_path), 180)
+    # Assert
+    assert not old_backup.exists(), "старая копия БД не удалена"
+    assert recent_backup.exists(), "свежая копия БД удалена"
+    assert unrelated.exists(), "удалён посторонний файл"
 
 
 def test_migration_from_legacy_vacancies_table(tmp_path):

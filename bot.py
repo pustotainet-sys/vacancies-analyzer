@@ -1437,6 +1437,7 @@ async def scheduled_vacuum(context: ContextTypes.DEFAULT_TYPE):
     conn = context.application.bot_data["conn"]
     await asyncio.to_thread(collector.prune_expired, conn)
     await asyncio.to_thread(storage.vacuum, conn)
+    await asyncio.to_thread(storage.prune_backups, DB_PATH, collector.history_retention_days())
 
 
 def _snapshot_age(snapshot):

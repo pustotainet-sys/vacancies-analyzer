@@ -9,6 +9,7 @@ import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 _LOCK = threading.Lock()
 MSK = timezone(timedelta(hours=3))
@@ -337,6 +338,17 @@ def prune_history(conn, history_days):
                      "AND finished_at < ?", (cutoff.isoformat(),))
         conn.execute("DELETE FROM daily_usage WHERE day < ?", (cutoff.date().isoformat(),))
         conn.commit()
+
+
+def prune_backups(db_path, history_days):
+    """Удалить созданные при деплоях копии SQLite старше срока истории."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=history_days)
+    database = Path(db_path)
+    for backup in database.parent.glob(f"{database.name}.pre-*"):
+        if backup.is_file() and not backup.is_symlink():
+            modified = datetime.fromtimestamp(backup.stat().st_mtime, timezone.utc)
+            if modified < cutoff:
+                backup.unlink()
 
 
 def vacuum(conn):

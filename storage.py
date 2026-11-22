@@ -132,6 +132,11 @@ def init_schema(conn):
                          "SELECT chat_id, query_text, area, COALESCE(updated_at, '') "
                          "FROM chat_state")
             conn.execute("INSERT INTO meta(key, value) VALUES('saved_filters_seeded', '1')")
+        # Очистить подписки, оставшиеся у заблокированных до исправления /ban.
+        conn.execute("DELETE FROM tracked_queries WHERE chat_id IN "
+                     "(SELECT chat_id FROM users WHERE status='banned')")
+        conn.execute("DELETE FROM job_watchers WHERE chat_id IN "
+                     "(SELECT chat_id FROM users WHERE status='banned')")
         conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
         conn.commit()
@@ -605,6 +610,9 @@ def touch_user(conn, chat_id, username=None):
 def set_user_status(conn, chat_id, status):
     with _LOCK:
         cur = conn.execute("UPDATE users SET status=? WHERE chat_id=?", (status, chat_id))
+        if cur.rowcount and status == "banned":
+            conn.execute("DELETE FROM tracked_queries WHERE chat_id=?", (chat_id,))
+            conn.execute("DELETE FROM job_watchers WHERE chat_id=?", (chat_id,))
         conn.commit()
     return cur.rowcount > 0
 
@@ -639,11 +647,14 @@ def create_invite(conn, code, created_by, max_uses=1, note=None):
 def redeem_invite(conn, code, chat_id, username=None):
     """Погасить код и зарегистрировать пользователя одной транзакцией.
 
-    Возвращает 'ok' | 'unknown_code' | 'exhausted'.
+    Возвращает 'ok' | 'unknown_code' | 'exhausted' | 'banned'.
     """
     ts_utc, _ = _now()
     code = (code or "").strip()
     with _LOCK:
+        existing = conn.execute("SELECT status FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+        if existing and existing["status"] == "banned":
+            return "banned"
         row = conn.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
         if not row:
             return "unknown_code"

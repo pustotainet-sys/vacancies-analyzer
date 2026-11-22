@@ -1102,6 +1102,9 @@ async def save_invite(update, context):
     user = update.effective_user
     verdict = storage.redeem_invite(_conn(context), update.message.text,
                                     cid, user.username if user else None)
+    if verdict == "banned":
+        await update.message.reply_text("Доступ закрыт. Обратитесь к администратору.")
+        return ConversationHandler.END
     if verdict == "unknown_code":
         await update.message.reply_text("Код не найден. Проверьте и пришлите ещё раз "
                                         "или /cancel.")
@@ -1224,6 +1227,9 @@ async def _set_status(update, context, status, done_text):
         await context.bot.send_message(cid, "Укажите chat_id: /ban 12345")
         return
     target = int(context.args[0])
+    if status == "banned" and _is_admin(target):
+        await context.bot.send_message(cid, "Администратора нельзя заблокировать через /ban.")
+        return
     ok = storage.set_user_status(_conn(context), target, status)
     _drop_gate_cache(context, target)
     await context.bot.send_message(cid, done_text.format(target) if ok
@@ -1272,8 +1278,17 @@ def _wake_workers(context):
         ev.set()
 
 
-async def _notify(bot, chat_ids, text, keyboard=None):
+def _can_receive(conn, chat_id):
+    if _is_admin(chat_id):
+        return True
+    user = storage.get_user(conn, chat_id)
+    return user is not None and user["status"] == "active"
+
+
+async def _notify(bot, conn, chat_ids, text, keyboard=None):
     for cid in chat_ids:
+        if not _can_receive(conn, cid):
+            continue
         try:
             await bot.send_message(cid, text, reply_markup=keyboard)
         except Exception as e:  # чат удалён/бот заблокирован — остальным доставить надо
@@ -1288,15 +1303,18 @@ async def _announce_result(app, job, res):
         return
     what = f"{job['query_text']} / {_area_label(job['area'])}"
     if res.get("status") != "ok":
-        await _notify(app.bot, chat_ids, f"Не получилось обновить {what}: {res.get('error')}")
+        await _notify(app.bot, conn, chat_ids,
+                      f"Не получилось обновить {what}: {res.get('error')}")
         return
     if job["kind"] == "collect":
         head = (f"Готово [{res.get('method', '?')}]: {what}. Вакансий: {res['n']} "
                 f"(новых: {res['new']}, из кэша: {res['reused']}).")
     else:
         head = f"Пересчитано [{res.get('method', '?')}]: {what}, вакансий {res['n']}."
-    await _notify(app.bot, chat_ids, head)
+    await _notify(app.bot, conn, chat_ids, head)
     for cid in chat_ids:
+        if not _can_receive(conn, cid):
+            continue
         st = storage.get_chat_state(conn, cid, STATE_DEFAULTS)
         if st["query_text"] != job["query_text"] or str(st["area"]) != str(job["area"]):
             continue  # пользователь уже переключился на другой запрос — топ не навязываем
@@ -1334,7 +1352,7 @@ async def _notify_top_change(app, job, res):
         return
     message = _top_change_text(job["query_text"], job["area"], changes)
     if message:
-        await _notify(app.bot, recipients, message)
+        await _notify(app.bot, conn, recipients, message)
 
 
 async def _run_job(app, job):
@@ -1348,7 +1366,7 @@ async def _run_job(app, job):
         # цикла и при остановке бота ругается «never awaited».
         if not watchers:
             return
-        coro = _notify(app.bot, watchers, msg)
+        coro = _notify(app.bot, conn, watchers, msg)
         try:
             asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:
@@ -1368,7 +1386,7 @@ async def _run_job(app, job):
     await _announce_result(app, job, res)
     await _notify_top_change(app, job, res)
     if not ok and ADMINS:
-        await _notify(app.bot, [int(a) for a in ADMINS],
+        await _notify(app.bot, conn, [int(a) for a in ADMINS],
                       f"⚠️ Задача {job['job_id']} ({job['query_text']}) упала: "
                       f"{res.get('error') or res.get('status')}")
 

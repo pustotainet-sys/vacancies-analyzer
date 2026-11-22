@@ -230,6 +230,75 @@ def test_ban_changes_status(conn):
     assert not storage.set_user_status(conn, 999, "banned")
 
 
+def test_ban_removes_subscriptions_and_pending_job_messages(conn):
+    # Arrange
+    storage.register_user(conn, 1)
+    storage.register_user(conn, 2)
+    storage.save_filter(conn, 1, "python", "all")
+    jobs.track(conn, "python", "all", 1)
+    jobs.track(conn, "python", "all", 2)
+    job_id, _, _ = jobs.enqueue(conn, "collect", "python", "all", 200, None, 1)
+    jobs.enqueue(conn, "collect", "python", "all", 200, None, 2)
+    # Act
+    banned = storage.set_user_status(conn, 1, "banned")
+    # Assert
+    assert banned, "пользователь не заблокирован"
+    assert jobs.user_tracked(conn, 1) == [], "подписка заблокированного осталась"
+    assert jobs.user_tracked(conn, 2) == [("python", "all")], (
+        "подписка другого пользователя затронута")
+    assert jobs.watchers(conn, job_id) == [2], "заблокированный ждёт результат задачи"
+    assert storage.user_saved_filters(conn, 1) == [("python", "all")], (
+        "личные фильтры должны сохраниться для возможной разблокировки")
+    storage.set_user_status(conn, 1, "active")
+    assert jobs.user_tracked(conn, 1) == [], "разблокировка автоматически вернула подписку"
+
+
+def test_banned_user_cannot_redeem_another_invite(conn):
+    # Arrange
+    storage.register_user(conn, 1)
+    storage.set_user_status(conn, 1, "banned")
+    storage.create_invite(conn, "NEW", 2)
+    # Act
+    verdict = storage.redeem_invite(conn, "NEW", 1)
+    # Assert
+    assert verdict == "banned", f"заблокированный восстановил доступ: {verdict}"
+    assert storage.get_user(conn, 1)["status"] == "banned", "статус блокировки изменён"
+    invite = conn.execute("SELECT used_count FROM invites WHERE code='NEW'").fetchone()
+    assert invite["used_count"] == 0, "инвайт потрачен на заблокированного"
+
+
+def test_ban_suppresses_messages_already_queued_for_delivery(conn):
+    # Arrange
+    import bot
+    sent = []
+
+    async def fake_send_message(chat_id, message, reply_markup=None):
+        sent.append(chat_id)
+
+    storage.register_user(conn, 1)
+    storage.register_user(conn, 2)
+    stale_recipients = [1, 2]
+    storage.set_user_status(conn, 1, "banned")
+    # Act
+    asyncio.run(bot._notify(SimpleNamespace(send_message=fake_send_message), conn,
+                            stale_recipients, "progress"))
+    # Assert
+    assert sent == [2], f"сообщение ушло заблокированному: {sent}"
+
+
+def test_startup_removes_legacy_banned_subscriptions(conn):
+    # Arrange
+    storage.register_user(conn, 1)
+    storage.set_user_status(conn, 1, "banned")
+    jobs.track(conn, "python", "all", 1)
+    job_id, _, _ = jobs.enqueue(conn, "collect", "python", "all", 200, None, 1)
+    # Act
+    storage.init_schema(conn)
+    # Assert
+    assert jobs.user_tracked(conn, 1) == [], "старое отслеживание пережило перезапуск"
+    assert jobs.watchers(conn, job_id) == [], "старое ожидание сообщения пережило перезапуск"
+
+
 # --- подписки ----------------------------------------------------------------
 def test_track_is_idempotent_and_listed(conn):
     jobs.track(conn, "golang", "113", 1)
@@ -581,6 +650,8 @@ def test_top_change_notifies_only_subscribers_after_second_collect(conn):
     async def fake_send_message(chat_id, message, reply_markup=None):
         sent.append((chat_id, message))
 
+    for chat_id in (1, 2, 3):
+        storage.register_user(conn, chat_id)
     jobs.track(conn, "python", "113", 1)
     jobs.track(conn, "python", "113", 2)
     jobs.track(conn, "rust", "113", 3)

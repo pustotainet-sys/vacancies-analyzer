@@ -154,29 +154,6 @@ def fetch_vacancies(session, text, area, per_page, max_items, extra_params=None,
     return items, total_found
 
 
-def fetch_relevant_vacancies(session, text, area, per_page, max_items):
-    """Первые 80% — совпадения в названии, остальные — в описании без дублей."""
-    title_limit = max(1, max_items * 4 // 5)
-    search_options = {"order_by": "relevance"}
-    title_items, title_found = fetch_vacancies(
-        session, text, area, per_page, title_limit,
-        extra_params=search_options, search_field="name")
-    description_query = f'"{text}"' if len(text.split()) > 1 else text
-    description_items, description_found = fetch_vacancies(
-        session, description_query, area, per_page, max_items,
-        extra_params=search_options, search_field="description")
-    selected = list(title_items)
-    seen_ids = {str(vacancy["id"]) for vacancy in selected}
-    for vacancy in description_items:
-        vacancy_id = str(vacancy["id"])
-        if vacancy_id not in seen_ids:
-            selected.append(vacancy)
-            seen_ids.add(vacancy_id)
-        if len(selected) >= max_items:
-            break
-    return selected, max(title_found, description_found)
-
-
 def flatten(v):
     salary = v.get("salary") or {}
     return {

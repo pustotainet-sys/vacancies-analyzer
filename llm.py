@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import time
 from collections import Counter
 from datetime import datetime
 
@@ -20,6 +21,7 @@ import requests
 from extract import strip_html
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MAX_MODEL_ATTEMPTS = 3
 
 # перечень моделей по приоритету: при ошибке пробуем следующую
 DEFAULT_MODELS = [
@@ -132,12 +134,23 @@ def _dump_write(f, obj):
         _log(f"ошибка записи дампа: {e}")
 
 
-def _chat_gemini(messages, temperature):
-    """Прямой вызов Gemini API (google-genai) с перебором моделей по приоритету.
+def _retry_model(error, model, attempt):
+    """Повторить временный сбой, но не постоянный HTTP 4xx, кроме 429."""
+    if attempt >= MAX_MODEL_ATTEMPTS:
+        return False
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else None
+    else:
+        status = getattr(error, "code", None)
+    if isinstance(status, int) and status < 500 and status != 429:
+        return False
+    _log(f"повторяю {model}: попытка {attempt + 1}/{MAX_MODEL_ATTEMPTS}")
+    time.sleep(attempt)
+    return True
 
-    При ошибке модели (например 503 UNAVAILABLE) логируем и пробуем следующую Gemini.
-    Все упали — RuntimeError (выше по стеку -> переход на OpenRouter).
-    """
+
+def _chat_gemini(messages, temperature):
+    """Прямой Gemini: до трёх попыток каждой модели, затем следующая."""
     from google import genai
     from google.genai import types
     system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
@@ -149,20 +162,25 @@ def _chat_gemini(messages, temperature):
     ms = gemini_models()
     last_err = None
     for idx, m in enumerate(ms):
-        try:
-            _log(f"Gemini {m} (приоритет {idx + 1}/{len(ms)})")
-            resp = client.models.generate_content(model=m, contents=user, config=cfg)
-            text = resp.text
-            if not text:
-                raise RuntimeError("пустой ответ")
-            if idx > 0:
-                _log(f"успешно на резервной Gemini {m}")
-            return text
-        except Exception as e:
-            last_err = e
-            _log(f"ошибка Gemini {m}: {type(e).__name__}: {str(e)[:150]}")
-            if idx + 1 < len(ms):
-                _log(f"переключаюсь на следующую Gemini: {ms[idx + 1]}")
+        for attempt in range(1, MAX_MODEL_ATTEMPTS + 1):
+            try:
+                _log(f"Gemini {m} (приоритет {idx + 1}/{len(ms)}, "
+                     f"попытка {attempt}/{MAX_MODEL_ATTEMPTS})")
+                resp = client.models.generate_content(model=m, contents=user, config=cfg)
+                text = resp.text
+                if not isinstance(text, str) or not text.strip():
+                    raise RuntimeError("пустой ответ")
+                if idx > 0:
+                    _log(f"успешно на резервной Gemini {m}")
+                return text
+            except Exception as e:
+                last_err = e
+                _log(f"ошибка Gemini {m}: {type(e).__name__}: {str(e)[:150]}")
+                if _retry_model(e, m, attempt):
+                    continue
+                break
+        if idx + 1 < len(ms):
+            _log(f"переключаюсь на следующую Gemini: {ms[idx + 1]}")
     raise RuntimeError(f"все {len(ms)} Gemini-моделей не сработали; последняя: {last_err}")
 
 
@@ -173,37 +191,42 @@ def _chat_openrouter(messages, temperature, timeout):
     ms = models()
     last_err = None
     for idx, m in enumerate(ms):
-        try:
-            _log(f"запрос к OpenRouter {m} (приоритет {idx + 1}/{len(ms)})")
-            resp = requests.post(
-                API_URL,
-                headers={"Authorization": f"Bearer {key}",
-                         "Content-Type": "application/json"},
-                json={"model": m, "messages": messages, "temperature": temperature,
-                      "max_tokens": _max_tokens()},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            choice = body["choices"][0]
-            content = choice["message"].get("content")
-            selected_model = body.get("model") or m
-            finish_reason = choice.get("finish_reason")
-            _log(f"OpenRouter выбрал {selected_model}; finish_reason={finish_reason}")
-            if not isinstance(content, str) or not content.strip():
-                raise RuntimeError(f"пустой текст от {selected_model}; "
-                                   f"finish_reason={finish_reason}")
-            if idx > 0:
-                _log(f"успешно на резервной модели {m}")
-            return content
-        except Exception as e:
-            detail = ""
-            if isinstance(e, requests.HTTPError) and e.response is not None:
-                detail = f" HTTP {e.response.status_code}: {e.response.text[:150]}"
-            last_err = e
-            _log(f"ошибка модели {m}: {type(e).__name__}{detail}")
-            if idx + 1 < len(ms):
-                _log(f"переключаюсь на следующую модель: {ms[idx + 1]}")
+        for attempt in range(1, MAX_MODEL_ATTEMPTS + 1):
+            try:
+                _log(f"запрос к OpenRouter {m} (приоритет {idx + 1}/{len(ms)}, "
+                     f"попытка {attempt}/{MAX_MODEL_ATTEMPTS})")
+                resp = requests.post(
+                    API_URL,
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"},
+                    json={"model": m, "messages": messages, "temperature": temperature,
+                          "max_tokens": _max_tokens()},
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                choice = body["choices"][0]
+                content = choice["message"].get("content")
+                selected_model = body.get("model") or m
+                finish_reason = choice.get("finish_reason")
+                _log(f"OpenRouter выбрал {selected_model}; finish_reason={finish_reason}")
+                if not isinstance(content, str) or not content.strip():
+                    raise RuntimeError(f"пустой текст от {selected_model}; "
+                                       f"finish_reason={finish_reason}")
+                if idx > 0:
+                    _log(f"успешно на резервной модели {m}")
+                return content
+            except Exception as e:
+                detail = ""
+                if isinstance(e, requests.HTTPError) and e.response is not None:
+                    detail = f" HTTP {e.response.status_code}: {e.response.text[:150]}"
+                last_err = e
+                _log(f"ошибка модели {m}: {type(e).__name__}{detail}")
+                if _retry_model(e, m, attempt):
+                    continue
+                break
+        if idx + 1 < len(ms):
+            _log(f"переключаюсь на следующую модель: {ms[idx + 1]}")
     raise RuntimeError(f"OpenRouter: все {len(ms)} моделей не сработали; последняя: {last_err}")
 
 
